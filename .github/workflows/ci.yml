@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: unit + vet + race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo 'run gofmt -w .'; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: unit tests (race)
+        run: go test -race ./...
+
+  integration:
+    name: integration + fault-injection + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      # pg_dump/pg_restore must be >= the newest server in the stand (PG 17);
+      # mysqldump/mysql for the MySQL roundtrip.
+      - name: install database clients
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17 default-mysql-client
+
+      - name: bring up the stand
+        run: make stand-up
+
+      - name: integration suite
+        run: make test-integration
+
+      - name: fault-injection suite
+        run: make test-fault
+
+      - name: coverage (own packages, threshold-gated)
+        run: make cover
+
+      - name: archive coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cover.out
+
+      - name: tear down the stand
+        if: always()
+        run: make stand-down
+
+  image:
+    name: build runtime image (pg_dump 14–17 + mysql client)
+    runs-on: ubuntu-latest # amd64 — MySQL APT ships an amd64 client
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build -t dbferry:ci .
+      - name: verify bundled clients
+        run: |
+          docker run --rm --entrypoint sh dbferry:ci -c '
+            ls /usr/lib/postgresql/14/bin/pg_dump \
+               /usr/lib/postgresql/15/bin/pg_dump \
+               /usr/lib/postgresql/16/bin/pg_dump \
+               /usr/lib/postgresql/17/bin/pg_dump
+            mysqldump --version | grep -qi mysql'

@@ -64,12 +64,13 @@ func (s pgSource) cluster() string {
 	return sanitizeKeySegment(c)
 }
 
-// dumpCommand builds `pg_dump -Fc -Z0` with the connection supplied entirely
-// through libpq env vars. -Fc is the custom format (selective restore, parallel
-// pg_restore) and -Z0 disables pg_dump's own compression so our zstd stage owns
-// it (DECISIONS.md 2026-07-11). No DSN or password reaches argv.
-func (s pgSource) dumpCommand(ctx context.Context) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "pg_dump", "-Fc", "-Z0")
+// dumpCommandWith builds `<binary> -Fc -Z0` with the connection supplied
+// entirely through libpq env vars. -Fc is the custom format (selective restore,
+// parallel pg_restore) and -Z0 disables pg_dump's own compression so our zstd
+// stage owns it (DECISIONS.md 2026-07-11). No DSN or password reaches argv.
+// binary is the (version-selected) pg_dump path (poc-plan 5.3).
+func (s pgSource) dumpCommandWith(ctx context.Context, binary string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, binary, "-Fc", "-Z0")
 	env := append(os.Environ(),
 		"PGHOST="+s.host,
 		"PGPORT="+s.port,
@@ -84,13 +85,23 @@ func (s pgSource) dumpCommand(ctx context.Context) *exec.Cmd {
 	return cmd
 }
 
-// dumpFailure turns a non-zero pg_dump exit into an actionable error carrying
-// the tail of its stderr. The DSN is not part of this message; full credential
-// redaction across all output arrives in poc-plan 3.3.
+// pgDumpVersionOf returns the version string of a pg_dump binary for the
+// manifest, e.g. "pg_dump (PostgreSQL) 17.2". Best-effort: "unknown" on error.
+func pgDumpVersionOf(ctx context.Context, binary string) string {
+	out, err := exec.CommandContext(ctx, binary, "--version").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// dumpFailure turns a non-zero dump-tool exit into an actionable error carrying
+// the tail of its stderr (which names the tool). The DSN is not part of this
+// message; full credential redaction across all output is poc-plan 3.3.
 func dumpFailure(waitErr error, stderrTail string) error {
 	stderrTail = strings.TrimSpace(stderrTail)
 	if stderrTail == "" {
-		return fmt.Errorf("pipeline: pg_dump failed: %w", waitErr)
+		return classify(KindDump, "pipeline: dump failed: %w", waitErr)
 	}
-	return fmt.Errorf("pipeline: pg_dump failed: %w\n%s", waitErr, stderrTail)
+	return classify(KindDump, "pipeline: dump failed: %w\n%s", waitErr, stderrTail)
 }

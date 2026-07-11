@@ -1,0 +1,6 @@
+.git
+dist
+/dbferry
+*.out
+*.test
+test/integration/.stand

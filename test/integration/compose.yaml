@@ -68,8 +68,11 @@ services:
     ports:
       - "9000:9000"   # S3 API
       - "9001:9001"   # web console
-    tmpfs:
-      - /data
+    # Disk-backed (not tmpfs): object payloads can be multi-GB during scale
+    # tests, and keeping them off RAM avoids pressuring the Docker VM. Cleared
+    # by `make stand-down` (compose down -v).
+    volumes:
+      - minio-data:/data
 
   # One-shot: wait for MinIO, then create the backups bucket. Its clean exit is
   # the readiness gate for `docker compose up --wait` (the minio image ships no
@@ -87,3 +90,6 @@ services:
       mc mb --ignore-existing local/dbferry-backups;
       echo 'stand: bucket local/dbferry-backups ready';
       "
+
+volumes:
+  minio-data:

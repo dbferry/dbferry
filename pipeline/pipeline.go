@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"filippo.io/age"
@@ -24,6 +26,11 @@ const (
 	DefaultPartSize    = 32 << 20 // 32 MiB
 	DefaultConcurrency = 4
 	maxUploadParts     = 10000 // hard S3 limit
+
+	// DefaultMaxRetries bounds SDK retries of a transient S3 operation
+	// (poc-plan 2.3). DefaultPartTimeout caps a single UploadPart.
+	DefaultMaxRetries  = 5
+	DefaultPartTimeout = 5 * time.Minute
 )
 
 // Config describes one backup run. DSN is a resolved secret: it must never be
@@ -45,6 +52,23 @@ type Config struct {
 	// the default.
 	PartSize    int64
 	Concurrency int
+	// MaxRetries and PartTimeout tune S3 resilience; zero uses the defaults.
+	MaxRetries  int
+	PartTimeout time.Duration
+	// AppVersion is the dbferry build version, recorded in the manifest. It is
+	// informational and may be empty.
+	AppVersion string
+	// AllowNonTransactional permits backing up non-transactional tables (MySQL
+	// MyISAM etc.) that can't be snapshotted consistently; without it such a
+	// database is refused rather than backed up with a silent inconsistency.
+	AllowNonTransactional bool
+	// Warn, if set, receives non-fatal warnings (e.g. a non-InnoDB dump
+	// proceeding under AllowNonTransactional).
+	Warn func(string)
+	// Progress, if set, is called periodically with a snapshot of the run. It
+	// must be cheap and non-blocking; the pipeline invokes it from one goroutine.
+	// The CLI renders it as live progress; the cloud service can persist it.
+	Progress func(Progress)
 }
 
 // Result summarises a completed backup. It carries no secrets and is safe to
@@ -53,11 +77,14 @@ type Result struct {
 	// BackupID is the unique id (UTC timestamp + ULID) embedded in the key.
 	BackupID string
 	// Bucket and Key locate the ciphertext object per the versioned key
-	// schema (DECISIONS.md); the manifest sibling lands in poc-plan 1.5.
-	Bucket string
-	Key    string
-	// Bytes is the number of ciphertext bytes uploaded.
-	Bytes int64
+	// schema (DECISIONS.md); ManifestKey is its .manifest.json sibling.
+	Bucket      string
+	Key         string
+	ManifestKey string
+	// Bytes and SHA256 are the size and hex SHA-256 of the ciphertext, as
+	// recorded in the manifest.
+	Bytes  int64
+	SHA256 string
 }
 
 // Run executes a single backup end to end: it streams pg_dump output through
@@ -68,26 +95,95 @@ type Result struct {
 //
 // It honours ctx cancellation: cancelling kills the dump child process, stops
 // the goroutines, and lets the upload abort (hardened further in poc-plan 2.1).
-func Run(ctx context.Context, cfg Config) (Result, error) {
+func Run(ctx context.Context, cfg Config) (res Result, err error) {
 	if cfg.PartSize == 0 {
 		cfg.PartSize = DefaultPartSize
 	}
 	if cfg.Concurrency == 0 {
 		cfg.Concurrency = DefaultConcurrency
 	}
+	if cfg.MaxRetries == 0 {
+		cfg.MaxRetries = DefaultMaxRetries
+	}
+	if cfg.PartTimeout == 0 {
+		cfg.PartTimeout = DefaultPartTimeout
+	}
 
-	// Derive a cancellable context so that returning from Run — on success or,
-	// crucially, on an upload error mid-stream — tears down pg_dump (started
-	// with exec.CommandContext) instead of leaving it blocked writing to a
-	// stdout pipe nobody is draining. Full cancellation handling is poc-plan
-	// 2.1; this just prevents a leak.
+	// Derive a cancellable context so that returning from Run — on success or on
+	// a failure mid-stream — tears down pg_dump (started with exec.CommandContext)
+	// instead of leaving it blocked writing to a stdout pipe nobody drains.
+	// Cancelling the parent (Ctrl+C) kills pg_dump, unblocks the feed goroutine,
+	// and makes the upload abort (poc-plan 2.1).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	src, err := parsePostgresDSN(cfg.DSN)
+	// If the parent context was cancelled (e.g. Ctrl+C), classify whatever error
+	// surfaced first as KindCanceled — regardless of whether it appeared in the
+	// preflight, the dump, or the upload. This defer runs before `cancel` above
+	// (LIFO), so ctx.Err() reflects only the parent's cancellation here.
+	defer func() {
+		if err != nil && ctx.Err() != nil && KindOf(err) != KindCanceled {
+			err = &Error{Kind: KindCanceled, Err: fmt.Errorf("pipeline: backup canceled: %w", err)}
+		}
+	}()
+
+	// Live progress: counters updated by the feed goroutine (bytes dumped) and
+	// the uploader (ciphertext bytes), sampled by a ticker into cfg.Progress.
+	var dumpedBytes, uploadedBytes atomic.Int64
+	var phase atomic.Int32
+	phase.Store(int32(PhaseConnecting))
+	started := time.Now()
+	snapshot := func() Progress {
+		return Progress{
+			Phase:         Phase(phase.Load()),
+			DumpedBytes:   dumpedBytes.Load(),
+			UploadedBytes: uploadedBytes.Load(),
+			Elapsed:       time.Since(started),
+		}
+	}
+	if cfg.Progress != nil {
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(150 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					cfg.Progress(snapshot()) // final snapshot, single-goroutine
+					return
+				case <-t.C:
+					cfg.Progress(snapshot())
+				}
+			}
+		}()
+		// Runs before `cancel` (LIFO) and blocks until the reporter goroutine
+		// has emitted its last snapshot, so no Progress call races the caller
+		// after Run returns.
+		defer func() { close(stop); wg.Wait() }()
+	}
+
+	// Select the engine driver from the DSN scheme (postgres:// or mysql://).
+	drv, err := newDriver(cfg.DSN)
 	if err != nil {
 		return Result{}, err
 	}
+
+	// Preflight: verify the connection (KindConnect if unreachable/unauthorized,
+	// distinct from a mid-dump failure), then run engine-specific safety checks
+	// (e.g. MySQL non-InnoDB detection) which may warn or refuse.
+	if err := drv.TestConnection(ctx); err != nil {
+		return Result{}, err
+	}
+	if err := drv.Preflight(ctx, DriverOptions{
+		AllowNonTransactional: cfg.AllowNonTransactional,
+		Warn:                  cfg.Warn,
+	}); err != nil {
+		return Result{}, err
+	}
+
 	dst, err := parseDest(cfg.Dest)
 	if err != nil {
 		return Result{}, err
@@ -102,41 +198,84 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	key := dst.objectKey("postgres", src.cluster(), src.database, now, backupID)
+	key := dst.objectKey(drv.Engine(), drv.Cluster(), drv.Database(), now, backupID)
 
 	uploader, err := newUploader(ctx, cfg)
 	if err != nil {
 		return Result{}, err
 	}
 
-	// pr/pw bridge the push side (pg_dump writing) to the pull side (the
-	// uploader reading Body). The feed goroutine writes dump→zstd→age into pw;
-	// the uploader reads ciphertext from pr.
+	// pr/pw bridge the push side (dump writing) to the pull side (the uploader
+	// reading Body). The feed goroutine writes dump→zstd→age into pw; the
+	// uploader reads ciphertext from pr.
 	pr, pw := io.Pipe()
 
-	cmd := src.dumpCommand(ctx)
-	stderr := newCappedBuffer(8 << 10) // keep the tail of pg_dump's stderr
+	cmd := drv.BuildDumpCommand(ctx)
+	stderr := newCappedBuffer(8 << 10) // keep the tail of the dump tool's stderr
 	cmd.Stderr = stderr
 	dumpOut, err := cmd.StdoutPipe()
 	if err != nil {
-		return Result{}, fmt.Errorf("pipeline: pg_dump stdout pipe: %w", err)
+		return Result{}, fmt.Errorf("pipeline: dump stdout pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return Result{}, fmt.Errorf("pipeline: start pg_dump: %w", err)
+		// e.g. the dump tool not on PATH — a dump-stage failure with a fix.
+		return Result{}, classify(KindDump, "pipeline: start %s: %w", cmd.Args[0], err)
 	}
 
-	go feed(pw, dumpOut, cmd, stderr, recipient)
+	go feed(pw, countReader{dumpOut, &dumpedBytes}, cmd, stderr, recipient)
 
-	out, err := uploader.upload(ctx, dst.bucket, key, pr)
+	phase.Store(int32(PhaseStreaming))
+	out, err := uploader.upload(ctx, dst.bucket, key, pr, &uploadedBytes)
 	if err != nil {
 		// Drain the pipe so the feed goroutine cannot block on a write; the
 		// upload has already aborted the multipart upload, so no final object
-		// exists.
+		// exists. Cancellation is classified by the deferred check above.
 		pr.CloseWithError(err)
 		return Result{}, err
 	}
 
-	return Result{BackupID: backupID, Bucket: dst.bucket, Key: key, Bytes: out.bytes}, nil
+	phase.Store(int32(PhaseFinalizing))
+
+	// The object is now complete. Write the manifest that makes it a valid
+	// backup — only now, never before (DECISIONS.md invariant). If this fails
+	// the object is an orphan without a manifest: Run must NOT report success,
+	// leaving it for reconciliation/cleanup (poc-plan 2.4).
+	mkey := manifestKey(key)
+	m := manifest{
+		KeySchema:        keySchemaVersion,
+		BackupID:         backupID,
+		CreatedAt:        manifestCreatedAt(now),
+		Engine:           drv.Engine(),
+		Cluster:          drv.Cluster(),
+		Database:         drv.Database(),
+		Object:           key,
+		Format:           drv.DumpFormat(),
+		DumpClient:       drv.DumpClientVersion(ctx),
+		DbferryVersion:   cfg.AppVersion,
+		CiphertextBytes:  out.bytes,
+		CiphertextSHA256: out.sha256,
+		PartSize:         cfg.PartSize,
+		Concurrency:      cfg.Concurrency,
+	}
+	body, err := m.marshal()
+	if err != nil {
+		return Result{}, err
+	}
+	if err := uploader.putObject(ctx, dst.bucket, mkey, body, "application/json"); err != nil {
+		return Result{}, classify(KindUpload, "pipeline: backup object uploaded but manifest write failed; "+
+			"the backup is not valid and needs reconciliation (%s): %w", key, err)
+	}
+
+	phase.Store(int32(PhaseDone))
+
+	return Result{
+		BackupID:    backupID,
+		Bucket:      dst.bucket,
+		Key:         key,
+		ManifestKey: mkey,
+		Bytes:       out.bytes,
+		SHA256:      out.sha256,
+	}, nil
 }
 
 // feed streams pg_dump's stdout through zstd and age into pw. It only closes pw
@@ -146,12 +285,14 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 func feed(pw *io.PipeWriter, dumpOut io.Reader, cmd interface{ Wait() error }, stderr *cappedBuffer, recipient age.Recipient) {
 	ageW, err := age.Encrypt(pw, recipient)
 	if err != nil {
-		pw.CloseWithError(fmt.Errorf("pipeline: start age: %w", err))
+		pw.CloseWithError(classify(KindDump, "pipeline: start age: %w", err))
 		return
 	}
-	zw, err := zstd.NewWriter(ageW)
+	// Single-goroutine encoder: one compression window instead of GOMAXPROCS,
+	// keeping the memory footprint predictable (poc-plan 6.3).
+	zw, err := zstd.NewWriter(ageW, zstd.WithEncoderConcurrency(1))
 	if err != nil {
-		pw.CloseWithError(fmt.Errorf("pipeline: start zstd: %w", err))
+		pw.CloseWithError(classify(KindDump, "pipeline: start zstd: %w", err))
 		return
 	}
 
@@ -162,17 +303,17 @@ func feed(pw *io.PipeWriter, dumpOut io.Reader, cmd interface{ Wait() error }, s
 
 	switch {
 	case copyErr != nil:
-		pw.CloseWithError(fmt.Errorf("pipeline: streaming pg_dump output: %w", copyErr))
+		pw.CloseWithError(classify(KindDump, "pipeline: streaming pg_dump output: %w", copyErr))
 	case waitErr != nil:
 		pw.CloseWithError(dumpFailure(waitErr, stderr.String()))
 	default:
 		// Finalize compression then encryption; only then signal clean EOF.
 		if err := zw.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("pipeline: finalize zstd: %w", err))
+			pw.CloseWithError(classify(KindDump, "pipeline: finalize zstd: %w", err))
 			return
 		}
 		if err := ageW.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("pipeline: finalize age: %w", err))
+			pw.CloseWithError(classify(KindDump, "pipeline: finalize age: %w", err))
 			return
 		}
 		pw.Close()

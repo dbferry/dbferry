@@ -58,7 +58,7 @@ func TestClusterLabel(t *testing.T) {
 // and DSN travel through libpq env vars, never on the child's argv.
 func TestDumpCommandKeepsSecretsOffArgv(t *testing.T) {
 	s := pgSource{host: "h", port: "5432", user: "u", password: "s3cr3t", database: "app"}
-	cmd := s.dumpCommand(context.Background())
+	cmd := s.dumpCommandWith(context.Background(), "pg_dump")
 
 	for _, arg := range cmd.Args {
 		if strings.Contains(arg, "s3cr3t") || strings.Contains(arg, "app") {

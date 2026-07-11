@@ -8,7 +8,7 @@ STAND_DIR   := test/integration
 COMPOSE     := docker compose -f $(STAND_DIR)/compose.yaml
 STAND_STATE := $(STAND_DIR)/.stand
 
-.PHONY: stand-up stand-down stand-ps stand-logs age-identity build test vet fmt
+.PHONY: stand-up stand-down stand-ps stand-logs age-identity build test test-race test-integration test-fault cover vet fmt
 
 ## stand-up: generate the age identity (if missing) and start every backend, waiting until healthy
 stand-up: age-identity
@@ -52,5 +52,22 @@ vet:
 fmt:
 	gofmt -w .
 
+## test: unit suite — fast, no external services
 test:
 	go test ./...
+
+## test-race: unit suite under the race detector
+test-race:
+	go test -race ./...
+
+## test-integration: full backup→restore→compare against the stand (needs `make stand-up`)
+test-integration:
+	go test -tags=integration ./test/integration/...
+
+## test-fault: fault-injection suite against the stand (needs `make stand-up`)
+test-fault:
+	go test -tags=faultinjection ./test/integration/...
+
+## cover: coverage of own packages across all suites, enforced against the threshold (needs the stand)
+cover:
+	./scripts/coverage.sh

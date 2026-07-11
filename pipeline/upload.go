@@ -1,86 +1,288 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"io"
-	"strings"
+	"sort"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithy "github.com/aws/smithy-go"
+	"golang.org/x/sync/errgroup"
 )
 
-// uploader wraps the S3 multipart manager. On a streaming (non-seekable) Body
-// it buffers one part at a time and uploads Concurrency parts in parallel, and
-// it aborts the multipart upload if the Body returns an error before EOF — so a
-// failed dump never leaves a completed object.
-//
-// TODO(migration): feature/s3/manager is deprecated in favour of
-// feature/s3/transfermanager; migrate once that module reaches a stable (v1)
-// release. It is currently v0.x (developer preview).
+// s3API is the subset of S3 operations the uploader needs. The real *s3.Client
+// satisfies it; tests inject fakes to simulate part failures, an ambiguous
+// CompleteMultipartUpload, and abort verification.
+type s3API interface {
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+	ListParts(context.Context, *s3.ListPartsInput, ...func(*s3.Options)) (*s3.ListPartsOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+}
+
+// uploader owns the multipart lifecycle so failures are handled explicitly:
+// aborts are verified via ListParts, and an ambiguous Complete is reconciled by
+// the unique object key rather than blindly retried or reported failed
+// (poc-plan 2.2/2.4).
 type uploader struct {
-	mgr *manager.Uploader
+	api         s3API
+	partSize    int64
+	concurrency int
+	partTimeout time.Duration
 }
 
 func newUploader(ctx context.Context, cfg Config) (*uploader, error) {
 	// Credentials and region come from the standard AWS chain (env vars,
-	// shared config); no secret is taken on argv.
-	awsCfg, err := config.LoadDefaultConfig(ctx)
+	// shared config); no secret is taken on argv. Transient part failures are
+	// retried by the SDK's standard retryer with a bounded attempt count
+	// (poc-plan 2.3).
+	opts := []func(*config.LoadOptions) error{
+		config.WithRetryer(func() aws.Retryer {
+			return retry.AddWithMaxAttempts(retry.NewStandard(), cfg.MaxRetries)
+		}),
+	}
+	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: load AWS config: %w", err)
+		return nil, classify(KindUpload, "load AWS config: %w", err)
 	}
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.S3Endpoint != "" {
-			// S3-compatible endpoint (e.g. MinIO): path-style addressing so a
-			// bucket name isn't required to be a DNS label.
 			o.BaseEndpoint = aws.String(cfg.S3Endpoint)
 			o.UsePathStyle = true
 		}
 	})
-	mgr := manager.NewUploader(client, func(u *manager.Uploader) {
-		u.PartSize = cfg.PartSize
-		u.Concurrency = cfg.Concurrency
-		u.MaxUploadParts = maxUploadParts
-	})
-	return &uploader{mgr: mgr}, nil
+	return &uploader{
+		api:         client,
+		partSize:    cfg.PartSize,
+		concurrency: cfg.Concurrency,
+		partTimeout: cfg.PartTimeout,
+	}, nil
 }
 
-type uploadResult struct{ bytes int64 }
+// newUploaderWithAPI builds an uploader over an injected S3 API, for tests.
+func newUploaderWithAPI(api s3API, partSize int64, concurrency int, partTimeout time.Duration) *uploader {
+	return &uploader{api: api, partSize: partSize, concurrency: concurrency, partTimeout: partTimeout}
+}
 
-func (u *uploader) upload(ctx context.Context, bucket, key string, body io.Reader) (uploadResult, error) {
-	cr := &countingReader{r: body}
-	_, err := u.mgr.Upload(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   cr,
+type uploadResult struct {
+	bytes  int64
+	sha256 string // hex SHA-256 of the ciphertext, for the manifest
+}
+
+// upload streams body into a multipart upload and completes it. It returns a
+// classified error on failure and never leaves a completed object behind on a
+// failure path (the multipart upload is aborted; an ambiguous Complete is
+// reconciled by key).
+func (u *uploader) upload(ctx context.Context, bucket, key string, body io.Reader, uploaded *atomic.Int64) (uploadResult, error) {
+	create, err := u.api.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
 	})
 	if err != nil {
-		return uploadResult{}, uploadError(err)
+		return uploadResult{}, classify(KindUpload, "create multipart upload: %w", err)
 	}
-	return uploadResult{bytes: cr.n.Load()}, nil
-}
+	uploadID := aws.ToString(create.UploadId)
 
-// uploadError adds an actionable hint when the 10k-part S3 limit is hit
-// (DECISIONS.md): the fix is a larger part size, not a retry.
-func uploadError(err error) error {
-	if strings.Contains(err.Error(), "MaxUploadParts") {
-		return fmt.Errorf("pipeline: upload exceeded the %d-part S3 limit; increase --part-size and retry: %w", maxUploadParts, err)
+	parts, total, sum, err := u.streamParts(ctx, bucket, key, uploadID, body, uploaded)
+	if err != nil {
+		// Body errors are already classified (KindDump) by the feed goroutine;
+		// part errors are KindUpload. Either way, abort and surface it.
+		u.abort(bucket, key, uploadID)
+		return uploadResult{}, err
 	}
-	return fmt.Errorf("pipeline: S3 upload: %w", err)
+
+	_, cerr := u.api.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(bucket),
+		Key:             aws.String(key),
+		UploadId:        aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	if cerr != nil {
+		// Ambiguous completion: the server may have completed the object even
+		// though the response failed. Reconcile by the unique key before
+		// deciding — never blindly re-Complete, never lose a finished backup.
+		if u.objectExists(bucket, key) {
+			return uploadResult{bytes: total, sha256: sum}, nil
+		}
+		u.abort(bucket, key, uploadID)
+		return uploadResult{}, classify(KindUpload, "complete multipart upload: %w", cerr)
+	}
+	return uploadResult{bytes: total, sha256: sum}, nil
 }
 
-// countingReader counts the ciphertext bytes handed to the uploader without
-// buffering them, so Result.Bytes reflects what actually landed in S3.
-type countingReader struct {
-	r io.Reader
-	n atomic.Int64
+// streamParts reads body in partSize chunks and uploads up to concurrency parts
+// in parallel, hashing the ciphertext in read order. It bounds memory to about
+// (concurrency+1) part buffers.
+func (u *uploader) streamParts(ctx context.Context, bucket, key, uploadID string, body io.Reader, uploaded *atomic.Int64) ([]types.CompletedPart, int64, string, error) {
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, u.concurrency)
+	var mu sync.Mutex
+	var parts []types.CompletedPart
+	hasher := sha256.New()
+	var total int64
+	var partNum int32
+	var readErr error
+
+	// Part buffers are pooled and the concurrency slot is acquired BEFORE a
+	// buffer is taken, so at most `concurrency` part buffers are ever live and
+	// they are reused rather than re-allocated. This bounds peak RSS to about
+	// concurrency×partSize plus runtime overhead, independent of dump size
+	// (poc-plan 6.3 memory budget).
+	bufPool := sync.Pool{New: func() any { b := make([]byte, u.partSize); return &b }}
+
+readLoop:
+	for {
+		select {
+		case sem <- struct{}{}:
+		case <-gctx.Done():
+			readErr = gctx.Err()
+			break readLoop
+		}
+		bufp := bufPool.Get().(*[]byte)
+		buf := *bufp
+		n, err := io.ReadFull(body, buf)
+		switch {
+		case err == nil || err == io.ErrUnexpectedEOF:
+			partNum++
+			if partNum > maxUploadParts {
+				bufPool.Put(bufp)
+				<-sem
+				readErr = classify(KindUpload,
+					"upload exceeded the %d-part S3 limit; increase --part-size and retry", maxUploadParts)
+				break readLoop
+			}
+			hasher.Write(buf[:n])
+			total += int64(n)
+			pn := partNum
+			data := buf[:n]
+			g.Go(func() error {
+				defer func() { bufPool.Put(bufp); <-sem }()
+				etag, uerr := u.uploadPart(gctx, bucket, key, uploadID, pn, data)
+				if uerr != nil {
+					return classify(KindUpload, "upload part %d: %w", pn, uerr)
+				}
+				if uploaded != nil {
+					uploaded.Add(int64(len(data)))
+				}
+				mu.Lock()
+				parts = append(parts, types.CompletedPart{ETag: aws.String(etag), PartNumber: aws.Int32(pn)})
+				mu.Unlock()
+				return nil
+			})
+			if err == io.ErrUnexpectedEOF {
+				break readLoop // partial final part dispatched
+			}
+		case err == io.EOF:
+			bufPool.Put(bufp)
+			<-sem
+			break readLoop // clean end
+		default:
+			bufPool.Put(bufp)
+			<-sem
+			readErr = err // body/dump error (already classified by feed)
+			break readLoop
+		}
+	}
+
+	werr := g.Wait()
+	if werr != nil {
+		return nil, 0, "", werr
+	}
+	if readErr != nil {
+		return nil, 0, "", readErr
+	}
+	sort.Slice(parts, func(i, j int) bool {
+		return aws.ToInt32(parts[i].PartNumber) < aws.ToInt32(parts[j].PartNumber)
+	})
+	return parts, total, hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n.Add(int64(n))
-	return n, err
+func (u *uploader) uploadPart(ctx context.Context, bucket, key, uploadID string, pn int32, data []byte) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, u.partTimeout)
+	defer cancel()
+	out, err := u.api.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String(key),
+		UploadId:   aws.String(uploadID),
+		PartNumber: aws.Int32(pn),
+		Body:       bytes.NewReader(data), // seekable, so the SDK can retry
+	})
+	if err != nil {
+		return "", err
+	}
+	return aws.ToString(out.ETag), nil
+}
+
+// abort tears down an incomplete multipart upload, verifying via ListParts and
+// retrying. It runs on a fresh context so cancelling the run doesn't skip
+// cleanup. If it can't confirm removal, a bucket lifecycle rule reclaims the
+// upload (poc-plan 2.2).
+func (u *uploader) abort(bucket, key, uploadID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 3; attempt++ {
+		u.api.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		})
+		_, err := u.api.ListParts(ctx, &s3.ListPartsInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		})
+		if isNoSuchUpload(err) {
+			return // confirmed gone
+		}
+		if err != nil {
+			continue // transient; retry
+		}
+		// Parts still listed: the upload survived; retry the abort.
+	}
+}
+
+// objectExists reports whether the completed object is present, on a fresh
+// context so run cancellation doesn't skew reconciliation.
+func (u *uploader) objectExists(bucket, key string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := u.api.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	return err == nil
+}
+
+// putObject writes a small object (the manifest) in a single request.
+func (u *uploader) putObject(ctx context.Context, bucket, key string, body []byte, contentType string) error {
+	_, err := u.api.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(body),
+		ContentType: aws.String(contentType),
+	})
+	return err
+}
+
+func isNoSuchUpload(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nsu *types.NoSuchUpload
+	if errors.As(err, &nsu) {
+		return true
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode() == "NoSuchUpload"
+	}
+	return false
 }
