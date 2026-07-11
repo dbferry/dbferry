@@ -1,0 +1,12 @@
+# Binaries
+/dbferry
+/dist/
+*.test
+
+# Go
+/vendor/
+*.out
+
+# Local secrets / dev DSN files — never commit
+*.dsn
+.env
