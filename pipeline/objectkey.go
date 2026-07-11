@@ -1,0 +1,79 @@
+package pipeline
+
+import (
+	"crypto/rand"
+	"fmt"
+	"net/url"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+)
+
+// dest is a parsed s3://bucket/prefix destination.
+type dest struct {
+	bucket string
+	prefix string
+}
+
+// parseDest parses an s3://bucket/prefix URL. The prefix may be empty.
+func parseDest(s string) (dest, error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return dest{}, fmt.Errorf("pipeline: parse --dest: invalid URL")
+	}
+	if u.Scheme != "s3" {
+		return dest{}, fmt.Errorf("pipeline: --dest must be an s3:// URL, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return dest{}, fmt.Errorf("pipeline: --dest is missing a bucket (s3://BUCKET/prefix)")
+	}
+	return dest{bucket: u.Host, prefix: strings.Trim(u.Path, "/")}, nil
+}
+
+// objectKey builds the versioned object key (key_schema 1, DECISIONS.md):
+//
+//	<prefix>/<engine>/<cluster>/<database>/<YYYY>/<MM>/<backup_id>.dump.zst.age
+//
+// The date segments drive lifecycle rules and bucket navigation. This is a
+// future public contract with the customer — change it only via a new schema
+// version.
+func (d dest) objectKey(engine, cluster, database string, t time.Time, backupID string) string {
+	segs := make([]string, 0, 7)
+	if d.prefix != "" {
+		segs = append(segs, d.prefix)
+	}
+	segs = append(segs,
+		engine,
+		cluster,
+		sanitizeKeySegment(database),
+		t.Format("2006"),
+		t.Format("01"),
+		backupID+".dump.zst.age",
+	)
+	return path.Join(segs...)
+}
+
+// newBackupID returns a backup id that is unique even for parallel backups of
+// one database: a sortable UTC timestamp plus a ULID (crypto/rand entropy).
+func newBackupID(t time.Time) (string, error) {
+	id, err := ulid.New(ulid.Timestamp(t), ulid.Monotonic(rand.Reader, 0))
+	if err != nil {
+		return "", fmt.Errorf("pipeline: generate backup id: %w", err)
+	}
+	return t.Format("20060102T150405Z") + "-" + id.String(), nil
+}
+
+// sanitizeKeySegment keeps a DSN-derived value safe and tidy inside an object
+// key: path separators and whitespace become underscores.
+func sanitizeKeySegment(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ' ', '\t', '\n':
+			return '_'
+		default:
+			return r
+		}
+	}, s)
+}

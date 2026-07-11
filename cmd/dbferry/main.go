@@ -52,6 +52,7 @@ func cmdRun(args []string) error {
 		dsnFile      = fs.String("dsn-file", "", "path to a file holding the DSN; local dev only, must be mode 0600")
 		dest         = fs.String("dest", "", "destination, e.g. s3://bucket/prefix")
 		ageRecipient = fs.String("age-recipient", "", "age public recipient to encrypt the backup to")
+		s3Endpoint   = fs.String("s3-endpoint", "", "S3-compatible endpoint URL (e.g. http://localhost:9000 for MinIO); empty for AWS S3")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -71,11 +72,19 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	return pipeline.Run(ctx, pipeline.Config{
+	res, err := pipeline.Run(ctx, pipeline.Config{
 		DSN:          dsn,
 		Dest:         *dest,
 		AgeRecipient: *ageRecipient,
+		S3Endpoint:   *s3Endpoint,
 	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("backup complete\n  backup_id  %s\n  object     s3://%s/%s\n  uploaded   %d bytes (ciphertext)\n",
+		res.BackupID, res.Bucket, res.Key, res.Bytes)
+	return nil
 }
 
 // resolveDSN loads the DSN from a file (local dev) or an env var, so the secret

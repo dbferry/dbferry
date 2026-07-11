@@ -1,0 +1,89 @@
+# Integration stand for dbferry (poc-plan 0.2).
+#
+# Reproducible local backends for integration and fault-injection tests:
+# PostgreSQL 14 + 17, MySQL 8, and a MinIO S3-compatible bucket. Brought up
+# with `make stand-up` (which also generates a throwaway age identity).
+#
+# The credentials below are FIXED LOCAL TEST VALUES, not secrets: they only
+# ever protect a disposable local stand. Real DSNs never live in this repo
+# (see CLAUDE.md) — they are passed to the CLI via env or a 0600 file.
+
+name: dbferry-stand
+
+services:
+  pg14:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: dbferry
+      POSTGRES_PASSWORD: dbferry
+      POSTGRES_DB: postgres
+    ports:
+      - "5414:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbferry -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  pg17:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: dbferry
+      POSTGRES_PASSWORD: dbferry
+      POSTGRES_DB: postgres
+    ports:
+      - "5417:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbferry -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  mysql8:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: dbferry
+      MYSQL_DATABASE: dbferry
+    ports:
+      - "3308:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pdbferry --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    tmpfs:
+      - /var/lib/mysql
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    tmpfs:
+      - /data
+
+  # One-shot: wait for MinIO, then create the backups bucket. Its clean exit is
+  # the readiness gate for `docker compose up --wait` (the minio image ships no
+  # curl/wget, so we probe with mc instead of a container healthcheck).
+  createbucket:
+    image: minio/mc
+    depends_on:
+      - minio
+    restart: "no"
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin && mc ready local; do
+        echo 'waiting for minio...'; sleep 1;
+      done;
+      mc mb --ignore-existing local/dbferry-backups;
+      echo 'stand: bucket local/dbferry-backups ready';
+      "
