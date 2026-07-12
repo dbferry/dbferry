@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
@@ -45,26 +46,48 @@ type uploader struct {
 	partTimeout time.Duration
 }
 
-func newUploader(ctx context.Context, cfg Config) (*uploader, error) {
-	// Credentials and region come from the standard AWS chain (env vars,
-	// shared config); no secret is taken on argv. Transient part failures are
-	// retried by the SDK's standard retryer with a bounded attempt count
-	// (poc-plan 2.3).
+// newS3Client builds the S3 client from Config: standard AWS chain unless the
+// destination provides a region/profile/static creds, and checksum-compat +
+// path-style for S3-compatible endpoints (ADR-0003).
+func newS3Client(ctx context.Context, cfg Config) (*s3.Client, error) {
+	maxRetries := cfg.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
 	opts := []func(*config.LoadOptions) error{
 		config.WithRetryer(func() aws.Retryer {
-			return retry.AddWithMaxAttempts(retry.NewStandard(), cfg.MaxRetries)
+			return retry.AddWithMaxAttempts(retry.NewStandard(), maxRetries)
 		}),
+	}
+	if cfg.S3Region != "" {
+		opts = append(opts, config.WithRegion(cfg.S3Region))
+	}
+	if cfg.S3Profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(cfg.S3Profile))
+	}
+	if c := cfg.S3Credentials; c != nil {
+		opts = append(opts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, c.SessionToken)))
 	}
 	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, classify(KindUpload, "load AWS config: %w", err)
 	}
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.S3Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.S3Endpoint)
 			o.UsePathStyle = true
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
-	})
+	}), nil
+}
+
+func newUploader(ctx context.Context, cfg Config) (*uploader, error) {
+	client, err := newS3Client(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &uploader{
 		api:         client,
 		partSize:    cfg.PartSize,

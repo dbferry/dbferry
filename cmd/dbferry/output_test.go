@@ -109,6 +109,24 @@ func TestHumanBytes(t *testing.T) {
 	}
 }
 
+func TestParsePartSize(t *testing.T) {
+	ok := map[string]int64{
+		"32MiB": 32 << 20, "5mib": 5 << 20, "1GiB": 1 << 30,
+		"10MB": 10_000_000, "8": 8 << 20, // bare number = MiB
+	}
+	for in, want := range ok {
+		got, err := parsePartSize(in)
+		if err != nil || got != want {
+			t.Errorf("parsePartSize(%q) = %d,%v want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"1MiB", "4MiB", "0", "abc", "-5MiB"} {
+		if _, err := parsePartSize(bad); err == nil {
+			t.Errorf("parsePartSize(%q) should error (below 5MiB min or invalid)", bad)
+		}
+	}
+}
+
 func TestExitCode(t *testing.T) {
 	cases := map[pipeline.Kind]int{
 		pipeline.KindConnect: 3, pipeline.KindDump: 4, pipeline.KindUpload: 5,

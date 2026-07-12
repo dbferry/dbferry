@@ -16,7 +16,7 @@ import (
 // can't be guaranteed to produce a restorable dump.
 const (
 	minSupportedPGMajor = 14
-	maxSupportedPGMajor = 17
+	maxSupportedPGMajor = 18
 )
 
 // pgClient is a discovered pg_dump binary and its major version.

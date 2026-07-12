@@ -45,9 +45,15 @@ type Config struct {
 	AgeRecipient string
 	// S3Endpoint, when non-empty, points at an S3-compatible endpoint (e.g.
 	// MinIO) and switches the client to path-style addressing. Empty means
-	// real AWS S3. Credentials and region come from the standard AWS config
-	// chain (env vars, shared config); no secret is taken on argv.
+	// real AWS S3.
 	S3Endpoint string
+	// S3Region, S3Profile and S3Credentials override how the S3 client
+	// authenticates. All are optional: with none set, credentials and region
+	// come from the standard AWS chain (env vars, shared config). No secret is
+	// taken on argv.
+	S3Region      string
+	S3Profile     string
+	S3Credentials *S3Credentials
 	// PartSize and Concurrency override the fixed defaults above; zero uses
 	// the default.
 	PartSize    int64
@@ -69,6 +75,14 @@ type Config struct {
 	// must be cheap and non-blocking; the pipeline invokes it from one goroutine.
 	// The CLI renders it as live progress; the cloud service can persist it.
 	Progress func(Progress)
+}
+
+// S3Credentials is a static credential set (e.g. from a named destination or
+// STS). SessionToken is empty for long-lived keys.
+type S3Credentials struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
 }
 
 // Result summarises a completed backup. It carries no secrets and is safe to

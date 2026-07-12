@@ -8,25 +8,61 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/dbferry/dbferry/config"
 	"github.com/dbferry/dbferry/pipeline"
 )
 
 // connFlags are the flags shared by the read-only commands (test-connection,
-// databases): a DSN source and output-mode switches.
+// databases): a DSN source (a named connection or --dsn-*) and output switches.
 type connFlags struct {
-	dsnEnv, dsnFile *string
-	jsonOut, quiet  *bool
-	noColor         *bool
+	connName, cfgPath *string
+	dsnEnv, dsnFile   *string
+	jsonOut, quiet    *bool
+	noColor           *bool
 }
 
 func registerConnFlags(fs *flag.FlagSet) connFlags {
 	return connFlags{
-		dsnEnv:  fs.String("dsn-env", "DBFERRY_DSN", "env var holding the DSN (never on argv)"),
-		dsnFile: fs.String("dsn-file", "", "file holding the DSN (local dev; must be mode 0600)"),
-		jsonOut: fs.Bool("json", false, "print a JSON result to stdout"),
-		quiet:   fs.Bool("quiet", false, "suppress the success line; only errors"),
-		noColor: fs.Bool("no-color", false, "disable ANSI colour"),
+		connName: fs.String("connection", "", "named connection from the config (instead of --dsn-*)"),
+		cfgPath:  fs.String("config", "", "config file path (with --connection)"),
+		dsnEnv:   fs.String("dsn-env", "DBFERRY_DSN", "env var holding the DSN (never on argv)"),
+		dsnFile:  fs.String("dsn-file", "", "file holding the DSN (local dev; must be mode 0600)"),
+		jsonOut:  fs.Bool("json", false, "print a JSON result to stdout"),
+		quiet:    fs.Bool("quiet", false, "suppress the success line; only errors"),
+		noColor:  fs.Bool("no-color", false, "disable ANSI colour"),
 	}
+}
+
+// source resolves the DSN to connect with (a named connection's connect DSN, or
+// --dsn-*) plus a redactor covering its secrets.
+func (c connFlags) source() (dsn string, redact func(string) string, err error) {
+	if *c.connName != "" {
+		cfg, lerr := config.Load(configPath(*c.cfgPath))
+		if lerr != nil {
+			return "", redactNothing, lerr
+		}
+		conn := cfg.Connections[*c.connName]
+		if conn == nil {
+			return "", redactNothing, fmt.Errorf("no connection named %q (see `dbferry connections list`)", *c.connName)
+		}
+		d, secrets, cerr := conn.ConnectDSN()
+		if cerr != nil {
+			return "", redactNothing, cerr
+		}
+		var red config.Redactor
+		red.Add(secrets...)
+		return d, red.Redact, nil
+	}
+	d, derr := resolveDSN(*c.dsnEnv, *c.dsnFile)
+	if derr != nil {
+		return "", redactNothing, derr
+	}
+	var red config.Redactor
+	red.Add(d)
+	if pw := passwordOf(d); pw != "" {
+		red.Add(pw)
+	}
+	return d, red.Redact, nil
 }
 
 func (c connFlags) ui(stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) *ui {
@@ -47,11 +83,10 @@ func cmdTestConnection(args []string, stdout, stderr io.Writer, stdoutTTY, stder
 	}
 	out := cf.ui(stdout, stderr, stdoutTTY, stderrTTY)
 
-	dsn, err := resolveDSN(*cf.dsnEnv, *cf.dsnFile)
+	dsn, redact, err := cf.source()
 	if err != nil {
 		return out.fail(err, redactNothing)
 	}
-	redact := newRedactor(dsn)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -77,11 +112,10 @@ func cmdDatabases(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY 
 	}
 	out := cf.ui(stdout, stderr, stdoutTTY, stderrTTY)
 
-	dsn, err := resolveDSN(*cf.dsnEnv, *cf.dsnFile)
+	dsn, redact, err := cf.source()
 	if err != nil {
 		return out.fail(err, redactNothing)
 	}
-	redact := newRedactor(dsn)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

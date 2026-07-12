@@ -38,6 +38,10 @@ type DatabaseDriver interface {
 	// DumpFormat and DumpClientVersion describe the dump for the manifest.
 	DumpFormat() string
 	DumpClientVersion(ctx context.Context) string
+
+	// Diagnose returns engine-specific health checks (dump-client availability
+	// and version compatibility) for `dbferry doctor` (poc-plan 0.5.5).
+	Diagnose(ctx context.Context) []Check
 }
 
 // DriverOptions carries run-time knobs into engine-specific preflight.

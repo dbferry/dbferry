@@ -207,3 +207,11 @@ func (d *mysqlDriver) DumpClientVersion(ctx context.Context) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+func (d *mysqlDriver) Diagnose(ctx context.Context) []Check {
+	if _, err := exec.LookPath("mysqldump"); err != nil {
+		return []Check{{Name: "mysqldump client", Status: StatusFail, Detail: "not found on PATH",
+			Fix: "install the MySQL client tools (mysql-client / mysql-community-client)"}}
+	}
+	return []Check{{Name: "mysqldump client", Status: StatusOK, Detail: d.DumpClientVersion(ctx)}}
+}

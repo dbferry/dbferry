@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 
 	"github.com/jackc/pgx/v5"
@@ -99,4 +100,32 @@ func (d *postgresDriver) DumpFormat() string { return "pg_dump -Fc -Z0 | zstd | 
 
 func (d *postgresDriver) DumpClientVersion(ctx context.Context) string {
 	return pgDumpVersionOf(ctx, d.pgDump())
+}
+
+func (d *postgresDriver) Diagnose(ctx context.Context) []Check {
+	major, err := postgresServerMajor(ctx, d.dsn)
+	if err != nil {
+		return []Check{{Name: "server version", Status: StatusFail, Detail: err.Error()}}
+	}
+	if err := checkSupportedPGMajor(major); err != nil {
+		return []Check{{Name: "server version", Status: StatusFail,
+			Detail: fmt.Sprintf("PostgreSQL %d", major),
+			Fix:    fmt.Sprintf("supported range is %d–%d; upgrade dbferry or use a supported server", minSupportedPGMajor, maxSupportedPGMajor)}}
+	}
+	checks := []Check{{Name: "server version", Status: StatusOK, Detail: fmt.Sprintf("PostgreSQL %d (supported)", major)}}
+
+	client, err := selectPgDump(discoverPgDumpClients(ctx), major)
+	switch {
+	case err != nil:
+		checks = append(checks, Check{Name: "pg_dump client", Status: StatusFail, Detail: err.Error(),
+			Fix: fmt.Sprintf("install postgresql-client-%d (or newer)", major)})
+	case client.major != major:
+		checks = append(checks, Check{Name: "pg_dump client", Status: StatusWarn,
+			Detail: fmt.Sprintf("pg_dump %d selected for server %d (works, but not an exact match)", client.major, major),
+			Fix:    fmt.Sprintf("install postgresql-client-%d for a matched, cleaner dump", major)})
+	default:
+		checks = append(checks, Check{Name: "pg_dump client", Status: StatusOK,
+			Detail: fmt.Sprintf("pg_dump %d (matches server)", client.major)})
+	}
+	return checks
 }

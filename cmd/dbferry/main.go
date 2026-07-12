@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 
+	"github.com/dbferry/dbferry/config"
 	"github.com/dbferry/dbferry/pipeline"
 )
 
@@ -53,12 +54,22 @@ func run(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int
 		return 1
 	}
 	switch args[0] {
+	case "init":
+		return cmdInit(args[1:], stdout, stderr, stdoutTTY, stderrTTY)
+	case "keygen":
+		return cmdKeygen(args[1:], stdout, stderr)
 	case "run":
 		return cmdRun(args[1:], stdout, stderr, stdoutTTY, stderrTTY)
 	case "test-connection":
 		return cmdTestConnection(args[1:], stdout, stderr, stdoutTTY, stderrTTY)
 	case "databases":
 		return cmdDatabases(args[1:], stdout, stderr, stdoutTTY, stderrTTY)
+	case "connections":
+		return cmdConnections(args[1:], stdout, stderr)
+	case "destinations":
+		return cmdDestinations(args[1:], stdout, stderr)
+	case "doctor":
+		return cmdDoctor(args[1:], stdout, stderr, stdoutTTY, stderrTTY)
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, version)
 		return 0
@@ -75,11 +86,17 @@ func run(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int
 func cmdRun(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int {
 	fs := newFlagSet("run", stderr)
 	var (
+		connName     = fs.String("connection", "", "named connection from the config (instead of --dsn-*/--dest)")
+		database     = fs.String("database", "", "database to back up (with --connection; overrides default_database)")
+		destName     = fs.String("destination", "", "named destination (with --connection; overrides the connection's default)")
+		cfgPath      = fs.String("config", "", "config file path (with --connection)")
 		dsnEnv       = fs.String("dsn-env", "DBFERRY_DSN", "name of the env var holding the database DSN (the DSN is never passed on argv)")
 		dsnFile      = fs.String("dsn-file", "", "path to a file holding the DSN; local dev only, must be mode 0600")
 		dest         = fs.String("dest", "", "destination, e.g. s3://bucket/prefix")
 		ageRecipient = fs.String("age-recipient", "", "age public recipient to encrypt the backup to")
 		s3Endpoint   = fs.String("s3-endpoint", "", "S3-compatible endpoint URL (e.g. http://localhost:9000 for MinIO); empty for AWS S3")
+		partSize     = fs.String("part-size", "", "multipart part size, e.g. 32MiB (min 5MiB, the S3 minimum); default 32MiB")
+		concurrency  = fs.Int("concurrency", 0, "number of parts uploaded in parallel; default 4")
 		allowNonTx   = fs.Bool("allow-nontransactional", false, "allow backing up non-transactional tables (e.g. MySQL MyISAM) that can't be snapshotted consistently")
 		jsonOut      = fs.Bool("json", false, "print one JSON result object to stdout instead of human output")
 		quiet        = fs.Bool("quiet", false, "suppress progress and the success summary; only errors are printed")
@@ -95,18 +112,91 @@ func cmdRun(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) 
 		json: *jsonOut, quiet: *quiet, color: !*noColor,
 	}
 
-	dsn, err := resolveDSN(*dsnEnv, *dsnFile)
-	if err != nil {
-		// No DSN was resolved, so there is no secret to redact here.
-		return out.fail(err, redactNothing)
-	}
-	redact := newRedactor(dsn)
+	// Resolve source + destination either from a named connection or from the
+	// standalone flags. A single Redactor collects every secret touched (DB
+	// password, S3 keys) so it is scrubbed from all output.
+	var (
+		red                       config.Redactor
+		dsn, destURL, recipient   string
+		endpoint, region, profile string
+		s3creds                   *pipeline.S3Credentials
+		err                       error
+	)
 
-	if *dest == "" {
-		return out.fail(usageErr("--dest is required (e.g. s3://bucket/prefix)"), redact)
+	if *connName != "" {
+		if *dsnFile != "" {
+			return out.fail(usageErr("choose either --connection or --dsn-file, not both"), redactNothing)
+		}
+		cfg, lerr := config.Load(configPath(*cfgPath))
+		if lerr != nil {
+			return out.fail(lerr, redactNothing)
+		}
+		conn := cfg.Connections[*connName]
+		if conn == nil {
+			return out.fail(usageErr(fmt.Sprintf("no connection named %q (see `dbferry connections list`)", *connName)), redactNothing)
+		}
+		var secrets []string
+		dsn, secrets, err = conn.BackupDSN(*database)
+		if err != nil {
+			return out.fail(err, red.Redact)
+		}
+		red.Add(secrets...)
+		recipient = conn.AgeRecipient
+
+		dn := *destName
+		if dn == "" {
+			dn = conn.Destination
+		}
+		if dn != "" {
+			dst := cfg.Destinations[dn]
+			if dst == nil {
+				return out.fail(usageErr(fmt.Sprintf("no destination named %q", dn)), red.Redact)
+			}
+			s3, dsecrets, rerr := dst.Resolve()
+			if rerr != nil {
+				return out.fail(rerr, red.Redact)
+			}
+			red.Add(dsecrets...)
+			destURL, endpoint, region, profile = dst.DestURL(), s3.Endpoint, s3.Region, s3.Profile
+			if s3.HasStatic {
+				s3creds = &pipeline.S3Credentials{AccessKeyID: s3.AccessKey, SecretAccessKey: s3.SecretKey, SessionToken: s3.SessionToken}
+			}
+		}
+	} else {
+		dsn, err = resolveDSN(*dsnEnv, *dsnFile)
+		if err != nil {
+			return out.fail(err, redactNothing)
+		}
+		red.Add(dsn)
+		if pw := passwordOf(dsn); pw != "" {
+			red.Add(pw)
+		}
 	}
-	if *ageRecipient == "" {
-		return out.fail(usageErr("--age-recipient is required (BYOK: your age public key)"), redact)
+
+	// Explicit flags override connection defaults.
+	if *dest != "" {
+		destURL = *dest
+	}
+	if *ageRecipient != "" {
+		recipient = *ageRecipient
+	}
+	if *s3Endpoint != "" {
+		endpoint = *s3Endpoint
+	}
+	redact := red.Redact
+
+	if destURL == "" {
+		return out.fail(usageErr("no destination: pass --dest or set one on the connection"), redact)
+	}
+	if recipient == "" {
+		return out.fail(usageErr("no age recipient: pass --age-recipient or set age_recipient on the connection"), redact)
+	}
+	var ps int64
+	if *partSize != "" {
+		ps, err = parsePartSize(*partSize)
+		if err != nil {
+			return out.fail(usageErr(err.Error()), redact)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -115,9 +205,14 @@ func cmdRun(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) 
 	rep := out.reporter()
 	res, err := pipeline.Run(ctx, pipeline.Config{
 		DSN:                   dsn,
-		Dest:                  *dest,
-		AgeRecipient:          *ageRecipient,
-		S3Endpoint:            *s3Endpoint,
+		Dest:                  destURL,
+		AgeRecipient:          recipient,
+		S3Endpoint:            endpoint,
+		S3Region:              region,
+		S3Profile:             profile,
+		S3Credentials:         s3creds,
+		PartSize:              ps,
+		Concurrency:           *concurrency,
 		AppVersion:            version,
 		AllowNonTransactional: *allowNonTx,
 		Warn:                  out.warn,
@@ -166,9 +261,15 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `dbferry — per-database backups for managed PostgreSQL/MySQL
 
 usage:
+  dbferry init                                     interactive setup of a named connection
+  dbferry keygen --out PATH                        generate an age identity
+  dbferry run --connection NAME [--database DB]    back up using a named connection
   dbferry run --dest s3://bucket/prefix --age-recipient age1... [--dsn-env DBFERRY_DSN | --dsn-file PATH]
-  dbferry test-connection [--dsn-env DBFERRY_DSN | --dsn-file PATH]
+  dbferry test-connection [--connection NAME | --dsn-env DBFERRY_DSN | --dsn-file PATH]
   dbferry databases [--dsn-env DBFERRY_DSN | --dsn-file PATH] [--json]
+  dbferry doctor [--connection NAME]               diagnose source + destination
+  dbferry connections  <list|show|add|rm> ...
+  dbferry destinations <list|show|add|rm> ...
   dbferry version
   dbferry help
 
@@ -180,6 +281,8 @@ run flags:
   --dest URL         destination, e.g. s3://bucket/prefix
   --age-recipient R  age public recipient to encrypt to (BYOK)
   --s3-endpoint URL  S3-compatible endpoint (e.g. MinIO); empty for AWS S3
+  --part-size SIZE   multipart part size, e.g. 32MiB (min 5MiB); default 32MiB
+  --concurrency N    parts uploaded in parallel; default 4
   --allow-nontransactional  allow non-InnoDB (e.g. MyISAM) MySQL tables
   --json             one JSON result object on stdout (for scripts)
   --quiet            no progress or summary (for cron)

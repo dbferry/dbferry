@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# dbferry runtime image (poc-plan 5.3). Ships pg_dump 14–17 so the pipeline can
+# dbferry runtime image (poc-plan 5.3). Ships pg_dump 14–18 so the pipeline can
 # dump each PostgreSQL server with a client of its own major version, plus the
 # genuine MySQL client. Published to ghcr.io/dbferry/dbferry.
 #
@@ -19,13 +19,13 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/dbferry ./cmd/dbferry
 
 FROM debian:bookworm-slim
-# PostgreSQL clients 14–17 (installed under /usr/lib/postgresql/<major>/bin,
+# PostgreSQL clients 14–18 (installed under /usr/lib/postgresql/<major>/bin,
 # where dbferry discovers them) and Oracle's MySQL client — NOT MariaDB's, whose
 # mysqldump rejects --set-gtid-purged — plus CA certs for S3 TLS.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
-    # PostgreSQL APT (PGDG) for pg_dump 14–17.
+    # PostgreSQL APT (PGDG) for pg_dump 14–18.
     install -d /usr/share/postgresql-common/pgdg; \
     curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
         https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
@@ -38,7 +38,7 @@ RUN set -eux; \
         > /etc/apt/sources.list.d/mysql.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        postgresql-client-14 postgresql-client-15 postgresql-client-16 postgresql-client-17 \
+        postgresql-client-14 postgresql-client-15 postgresql-client-16 postgresql-client-17 postgresql-client-18 \
         mysql-community-client; \
     apt-get purge -y curl gnupg; apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*

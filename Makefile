@@ -60,13 +60,13 @@ test:
 test-race:
 	go test -race ./...
 
-## test-integration: full backup→restore→compare against the stand (needs `make stand-up`)
+## test-integration: full backup→restore→compare + CLI (named connections) against the stand (needs `make stand-up`)
 test-integration:
-	go test -tags=integration ./test/integration/...
+	go test -tags=integration ./...
 
 ## test-fault: fault-injection suite against the stand (needs `make stand-up`)
 test-fault:
-	go test -tags=faultinjection ./test/integration/...
+	go test -tags=faultinjection ./...
 
 ## cover: coverage of own packages across all suites, enforced against the threshold (needs the stand)
 cover:

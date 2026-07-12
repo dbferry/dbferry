@@ -42,12 +42,12 @@ func TestSelectPgDump(t *testing.T) {
 }
 
 func TestCheckSupportedPGMajor(t *testing.T) {
-	for _, m := range []int{14, 15, 16, 17} {
+	for _, m := range []int{14, 15, 16, 17, 18} {
 		if err := checkSupportedPGMajor(m); err != nil {
 			t.Errorf("major %d should be supported: %v", m, err)
 		}
 	}
-	for _, m := range []int{13, 18, 12} {
+	for _, m := range []int{13, 19, 12} {
 		if err := checkSupportedPGMajor(m); err == nil {
 			t.Errorf("major %d should be unsupported", m)
 		}

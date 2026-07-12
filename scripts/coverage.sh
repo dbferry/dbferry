@@ -10,7 +10,7 @@
 set -euo pipefail
 
 THRESHOLD="${COVER_THRESHOLD:-80}"
-COVER_PKGS="github.com/dbferry/dbferry/pipeline"
+COVER_PKGS="github.com/dbferry/dbferry/pipeline,github.com/dbferry/dbferry/config"
 
 # Profile path is kept (gitignored *.out) so CI can archive it as an artifact.
 profile="${COVER_PROFILE:-cover.out}"

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -244,6 +245,32 @@ func paint(enabled bool, code, s string) string {
 		return s
 	}
 	return code + s + colorReset
+}
+
+// parsePartSize parses a multipart part size like "32MiB", "64MB" or a bare
+// number (interpreted as MiB), enforcing the 5 MiB S3 minimum for parts.
+func parsePartSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	mult := int64(1) << 20 // bare number → MiB
+	switch l := strings.ToLower(s); {
+	case strings.HasSuffix(l, "gib"):
+		mult, s = 1<<30, s[:len(s)-3]
+	case strings.HasSuffix(l, "mib"):
+		mult, s = 1<<20, s[:len(s)-3]
+	case strings.HasSuffix(l, "gb"):
+		mult, s = 1_000_000_000, s[:len(s)-2]
+	case strings.HasSuffix(l, "mb"):
+		mult, s = 1_000_000, s[:len(s)-2]
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid --part-size %q (e.g. 32MiB)", s)
+	}
+	b := int64(n * float64(mult))
+	if b < 5<<20 {
+		return 0, fmt.Errorf("--part-size must be at least 5MiB (the S3 minimum for a multipart part)")
+	}
+	return b, nil
 }
 
 func humanBytes(n int64) string {

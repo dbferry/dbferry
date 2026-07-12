@@ -65,7 +65,7 @@ jobs:
         run: make stand-down
 
   image:
-    name: build runtime image (pg_dump 14–17 + mysql client)
+    name: build runtime image (pg_dump 14–18 + mysql client)
     runs-on: ubuntu-latest # amd64 — MySQL APT ships an amd64 client
     steps:
       - uses: actions/checkout@v4
@@ -77,5 +77,6 @@ jobs:
             ls /usr/lib/postgresql/14/bin/pg_dump \
                /usr/lib/postgresql/15/bin/pg_dump \
                /usr/lib/postgresql/16/bin/pg_dump \
-               /usr/lib/postgresql/17/bin/pg_dump
+               /usr/lib/postgresql/17/bin/pg_dump \
+               /usr/lib/postgresql/18/bin/pg_dump
             mysqldump --version | grep -qi mysql'
