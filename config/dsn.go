@@ -26,23 +26,52 @@ func (conn *Connection) BackupDSN(database string) (dsn string, secrets []string
 	return conn.withPassword(db)
 }
 
-// withPassword parses the template, optionally overrides the database, and
-// injects the resolved password via url.UserPassword (correct encoding). All
-// other DSN options survive verbatim.
+// withPassword resolves the password reference and renders the template via
+// BuildDSN.
 func (conn *Connection) withPassword(database string) (string, []string, error) {
 	pw, err := conn.Password.Resolve()
 	if err != nil {
 		return "", nil, err
 	}
-	u, err := url.Parse(conn.DSN)
+	dsn, err := BuildDSN(conn.DSN, pw, database)
 	if err != nil {
-		return "", nil, fmt.Errorf("connection dsn: invalid URL")
+		return "", nil, err
+	}
+	return dsn, []string{pw}, nil
+}
+
+// BuildDSN renders a password-stripped DSN template into a connectable DSN:
+// it optionally overrides the database and injects the password via
+// url.UserPassword (correct encoding). All other DSN options survive
+// verbatim. It is deliberately free of secret-resolution concerns so the
+// cloud service can reuse it with its own secret backend (ADR-0001).
+func BuildDSN(template, password, database string) (string, error) {
+	u, err := url.Parse(template)
+	if err != nil {
+		return "", fmt.Errorf("connection dsn: invalid URL")
 	}
 	if database != "" {
 		u.Path = "/" + database
 	}
-	u.User = url.UserPassword(u.User.Username(), pw)
-	return u.String(), []string{pw}, nil
+	u.User = url.UserPassword(u.User.Username(), password)
+	return u.String(), nil
+}
+
+// ValidateDSNTemplate checks that a DSN template is a parseable URL that
+// holds no inline password — the template is stored, and stored DSNs must
+// never contain a secret (ADR-0004).
+func ValidateDSNTemplate(dsn string) error {
+	if dsn == "" {
+		return fmt.Errorf("dsn is required")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("dsn is not a valid URL")
+	}
+	if _, hasPw := u.User.Password(); hasPw {
+		return fmt.Errorf("the dsn template must NOT contain a password; store the password separately")
+	}
+	return nil
 }
 
 // S3Settings is a destination resolved for the pipeline. Static creds are empty
