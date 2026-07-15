@@ -7,9 +7,9 @@ import (
 
 func TestBuildDSN(t *testing.T) {
 	tests := []struct {
-		name               string
-		template, pw, db   string
-		want               string
+		name             string
+		template, pw, db string
+		want             string
 	}{
 		{
 			name:     "injects password and database",
@@ -49,13 +49,25 @@ func TestValidateDSNTemplate(t *testing.T) {
 	if err := ValidateDSNTemplate("postgres://backup@host/db?sslmode=require"); err != nil {
 		t.Errorf("valid template rejected: %v", err)
 	}
-	if err := ValidateDSNTemplate(""); err == nil {
-		t.Error("empty template accepted")
+
+	rejected := map[string]string{
+		"":                                        "empty template",
+		"postgres://backup:leak@host/db":          "inline password",
+		"postgres://backup@host/db?password=x":    "password query parameter",
+		"postgres://backup@host/db?PassWord=x":    "mixed-case password query parameter",
+		"postgres://backup@host/db?sslpassword=x": "sslpassword query parameter",
+		"mysql://root@host/db?passwd=x":           "passwd query parameter",
+		"mysql://root@host/db?pwd=x":              "pwd query parameter",
+		"relative/path":                           "relative URL",
+		"host:5432/db":                            "URL without scheme",
 	}
+	for dsn, why := range rejected {
+		if err := ValidateDSNTemplate(dsn); err == nil {
+			t.Errorf("template with %s accepted: %q", why, dsn)
+		}
+	}
+
 	err := ValidateDSNTemplate("postgres://backup:leak@host/db")
-	if err == nil {
-		t.Fatal("template with inline password accepted")
-	}
 	if !strings.Contains(err.Error(), "password") {
 		t.Errorf("error should mention the password: %v", err)
 	}

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/url"
+	"strings"
 )
 
 // ConnectDSN returns a DSN for connecting/discovery: the stored template with
@@ -57,9 +58,11 @@ func BuildDSN(template, password, database string) (string, error) {
 	return u.String(), nil
 }
 
-// ValidateDSNTemplate checks that a DSN template is a parseable URL that
-// holds no inline password — the template is stored, and stored DSNs must
-// never contain a secret (ADR-0004).
+// ValidateDSNTemplate checks that a DSN template is a parseable absolute URL
+// that holds no inline password — the template is stored, and stored DSNs
+// must never contain a secret (ADR-0004). Secrets hide in two places:
+// the userinfo (user:pw@) and driver query parameters (libpq accepts
+// ?password=... and ?sslpassword=...), so both are rejected.
 func ValidateDSNTemplate(dsn string) error {
 	if dsn == "" {
 		return fmt.Errorf("dsn is required")
@@ -68,8 +71,20 @@ func ValidateDSNTemplate(dsn string) error {
 	if err != nil {
 		return fmt.Errorf("dsn is not a valid URL")
 	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("dsn must be an absolute URL (scheme://user@host[:port]/db)")
+	}
 	if _, hasPw := u.User.Password(); hasPw {
 		return fmt.Errorf("the dsn template must NOT contain a password; store the password separately")
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return fmt.Errorf("dsn query string is not valid")
+	}
+	for key := range q {
+		if k := strings.ToLower(key); strings.Contains(k, "password") || k == "passwd" || k == "pwd" {
+			return fmt.Errorf("the dsn template must NOT contain a password (query parameter %q); store the password separately", key)
+		}
 	}
 	return nil
 }

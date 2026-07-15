@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"net/url"
 	"sort"
 )
 
@@ -74,15 +73,8 @@ func (conn *Connection) Validate() error {
 	default:
 		return fmt.Errorf("engine must be postgres or mysql, got %q", conn.Engine)
 	}
-	if conn.DSN == "" {
-		return fmt.Errorf("dsn is required")
-	}
-	u, err := url.Parse(conn.DSN)
-	if err != nil {
-		return fmt.Errorf("dsn is not a valid URL")
-	}
-	if _, hasPw := u.User.Password(); hasPw {
-		return fmt.Errorf("the stored dsn must NOT contain a password; keep it in `password` (keyring/env) instead")
+	if err := ValidateDSNTemplate(conn.DSN); err != nil {
+		return err
 	}
 	if conn.Password.empty() {
 		return fmt.Errorf("password reference is required (keyring or env)")
