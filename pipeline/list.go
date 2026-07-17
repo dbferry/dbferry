@@ -258,14 +258,16 @@ func readManifest(ctx context.Context, api s3ObjectAPI, bucket, cipherKey, manif
 		info.State = BackupUnsupportedSchema
 		return info, nil
 	}
-	if m.Object != cipherKey {
-		// A manifest that does not describe its sibling is not trustworthy.
+	// Only an exact, fully-populated schema-1 manifest that describes its
+	// sibling is trusted; anything less is corrupt and never touched. JSON
+	// zero values must not slip through as "valid" — a manifest is the thing
+	// that makes a ciphertext deletable.
+	created, timeErr := time.Parse(time.RFC3339, m.CreatedAt)
+	if m.KeySchema != keySchemaVersion || m.Object != cipherKey || m.BackupID == "" || timeErr != nil {
 		info.State = BackupCorruptManifest
 		return info, nil
 	}
-	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
-		info.CreatedAt = t.UTC()
-	}
+	info.CreatedAt = created.UTC()
 	info.State = BackupValid
 	info.Manifest = &m
 	return info, nil

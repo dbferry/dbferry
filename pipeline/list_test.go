@@ -128,6 +128,14 @@ func TestListBackupsPairsAndStates(t *testing.T) {
 	mismatchKey := f.putBackup(testScope, mustTime(t, "2026-07-11T02:00:00Z"), "c4")
 	f.objects[manifestKey(mismatchKey)] = []byte(`{"key_schema":1,"object":"somebody/else` + ciphertextSuffix + `"}`)
 
+	// JSON zero values must not pass as valid: a manifest with only the
+	// object reference (key_schema 0, no backup_id, no created_at) is corrupt.
+	skeletonKey := f.putBackup(testScope, mustTime(t, "2026-07-10T02:00:00Z"), "c5")
+	f.objects[manifestKey(skeletonKey)] = []byte(`{"object":"` + skeletonKey + `"}`)
+
+	badTimeKey := f.putBackup(testScope, mustTime(t, "2026-07-09T02:00:00Z"), "c6")
+	f.objects[manifestKey(badTimeKey)] = []byte(`{"key_schema":1,"backup_id":"x","created_at":"yesterday","object":"` + badTimeKey + `"}`)
+
 	f.objects[testScope+"README.txt"] = []byte("not a backup artifact")
 	f.objects["outside/scope/20260715T020000Z-X"+ciphertextSuffix] = []byte("different database")
 
@@ -147,6 +155,8 @@ func TestListBackupsPairsAndStates(t *testing.T) {
 		corruptKey:  BackupCorruptManifest,
 		futureKey:   BackupUnsupportedSchema,
 		mismatchKey: BackupCorruptManifest,
+		skeletonKey: BackupCorruptManifest,
+		badTimeKey:  BackupCorruptManifest,
 	}
 	if len(states) != len(want) {
 		t.Fatalf("listed %d artifacts %v, want %d", len(states), states, len(want))
