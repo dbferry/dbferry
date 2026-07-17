@@ -127,6 +127,14 @@ func ListBackups(ctx context.Context, cfg Config) (Listing, error) {
 	return listBackups(ctx, api, dst.bucket, scope)
 }
 
+// BackupScope returns the per-database scope prefix a backup object key
+// belongs to: everything above the <YYYY>/<MM>/<file> tail of the key_schema-1
+// layout, with a trailing slash. It lets a caller pin a retention pass to the
+// exact scope a specific backup was written to.
+func BackupScope(objectKey string) string {
+	return path.Dir(path.Dir(path.Dir(objectKey))) + "/"
+}
+
 // backupScope derives the per-database key prefix from the run configuration,
 // sharing the exact derivation Run uses for the object key.
 func backupScope(cfg Config) (string, dest, error) {

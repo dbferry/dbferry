@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,7 +18,17 @@ const deleteBatchSize = 1000
 type PruneOptions struct {
 	// DryRun selects what would be deleted without deleting anything.
 	DryRun bool
+	// RequireScope, when non-empty, pins the pass to an expected scope
+	// (as returned by BackupScope): if the scope derived from cfg differs —
+	// e.g. the stored connection or destination was edited between enqueue
+	// and execution — the pass refuses with ErrScopeMismatch instead of
+	// pruning a scope no fresh backup has landed in.
+	RequireScope string
 }
+
+// ErrScopeMismatch is returned by Prune when RequireScope does not match the
+// scope derived from the configuration. Nothing has been listed or deleted.
+var ErrScopeMismatch = errors.New("pipeline: prune scope mismatch")
 
 // PruneResult reports what a retention pass saw and did.
 type PruneResult struct {
@@ -46,11 +57,14 @@ func Prune(ctx context.Context, cfg Config, policy RetentionPolicy, opts PruneOp
 	if err := policy.Validate(); err != nil {
 		return PruneResult{}, err
 	}
-	api, err := newS3Client(ctx, cfg)
+	scope, dst, err := backupScope(cfg)
 	if err != nil {
 		return PruneResult{}, err
 	}
-	scope, dst, err := backupScope(cfg)
+	if opts.RequireScope != "" && opts.RequireScope != scope {
+		return PruneResult{}, fmt.Errorf("%w: config resolves to %q, caller expects %q", ErrScopeMismatch, scope, opts.RequireScope)
+	}
+	api, err := newS3Client(ctx, cfg)
 	if err != nil {
 		return PruneResult{}, err
 	}

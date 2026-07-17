@@ -139,6 +139,27 @@ func TestPrunePartialDeleteErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestBackupScope(t *testing.T) {
+	key := "pfx/postgres/host_5433/db/2026/07/20260717T120000Z-X" + ciphertextSuffix
+	if got := BackupScope(key); got != "pfx/postgres/host_5433/db/" {
+		t.Fatalf("BackupScope(%q) = %q", key, got)
+	}
+}
+
+func TestPruneRequireScopeMismatch(t *testing.T) {
+	// Prune with a RequireScope that cannot match any derived scope must
+	// refuse before touching the bucket.
+	cfg := Config{
+		DSN:  "postgres://u@host:5432/db",
+		Dest: "s3://bucket/pfx",
+	}
+	_, err := Prune(context.Background(), cfg, RetentionPolicy{KeepDaily: 1},
+		PruneOptions{RequireScope: "elsewhere/postgres/other/db/"})
+	if err == nil || !strings.Contains(err.Error(), "scope mismatch") {
+		t.Fatalf("Prune with foreign RequireScope = %v, want ErrScopeMismatch", err)
+	}
+}
+
 func TestPruneManyDropsBatchesDeletes(t *testing.T) {
 	f := newFakeObjectStore()
 	base := mustTime(t, "2026-01-01T00:00:00Z")
