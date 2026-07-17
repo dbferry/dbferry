@@ -16,11 +16,11 @@ const keySchemaVersion = 1
 // restorer knows the exact inverse chain to run.
 const backupFormat = "pg_dump -Fc -Z0 | zstd | age"
 
-// manifest is the JSON sidecar written next to a completed backup object. A
+// Manifest is the JSON sidecar written next to a completed backup object. A
 // backup is valid only with its manifest, and the manifest is written only
 // after the object's multipart upload completes (DECISIONS.md). Field names are
 // part of the versioned public contract — change them only via keySchemaVersion.
-type manifest struct {
+type Manifest struct {
 	KeySchema        int    `json:"key_schema"`
 	BackupID         string `json:"backup_id"`
 	CreatedAt        string `json:"created_at"` // RFC3339, UTC
@@ -40,10 +40,10 @@ type manifest struct {
 // manifestKey is the manifest's object key: the sibling of the ciphertext key
 // with the .dump.zst.age suffix replaced by .manifest.json (DECISIONS.md).
 func manifestKey(objectKey string) string {
-	return strings.TrimSuffix(objectKey, ".dump.zst.age") + ".manifest.json"
+	return strings.TrimSuffix(objectKey, ciphertextSuffix) + manifestSuffix
 }
 
-func (m manifest) marshal() ([]byte, error) {
+func (m Manifest) marshal() ([]byte, error) {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: marshal manifest: %w", err)

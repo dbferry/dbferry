@@ -255,7 +255,7 @@ func Run(ctx context.Context, cfg Config) (res Result, err error) {
 	// the object is an orphan without a manifest: Run must NOT report success,
 	// leaving it for reconciliation/cleanup (poc-plan 2.4).
 	mkey := manifestKey(key)
-	m := manifest{
+	m := Manifest{
 		KeySchema:        keySchemaVersion,
 		BackupID:         backupID,
 		CreatedAt:        manifestCreatedAt(now),

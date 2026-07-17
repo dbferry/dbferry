@@ -16,7 +16,7 @@ func TestManifestKey(t *testing.T) {
 }
 
 func TestManifestMarshalRoundTrip(t *testing.T) {
-	m := manifest{
+	m := Manifest{
 		KeySchema:        keySchemaVersion,
 		BackupID:         "20260711T164025Z-01KX90TDX1XVMNBKV3GTF67CE3",
 		CreatedAt:        "2026-07-11T16:40:25Z",
@@ -35,7 +35,7 @@ func TestManifestMarshalRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got manifest
+	var got Manifest
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("manifest is not valid JSON: %v", err)
 	}
