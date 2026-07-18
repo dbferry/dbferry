@@ -67,7 +67,7 @@ func (s pgSource) cluster() string {
 // dumpCommandWith builds `<binary> -Fc -Z0` with the connection supplied
 // entirely through libpq env vars. -Fc is the custom format (selective restore,
 // parallel pg_restore) and -Z0 disables pg_dump's own compression so our zstd
-// stage owns it (DECISIONS.md 2026-07-11). No DSN or password reaches argv.
+// stage owns it (ADR-0005). No DSN or password reaches argv.
 // binary is the (version-selected) pg_dump path (poc-plan 5.3).
 func (s pgSource) dumpCommandWith(ctx context.Context, binary string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, "-Fc", "-Z0")

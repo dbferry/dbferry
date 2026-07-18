@@ -32,7 +32,7 @@ func parseDest(s string) (dest, error) {
 	return dest{bucket: u.Host, prefix: strings.Trim(u.Path, "/")}, nil
 }
 
-// objectKey builds the versioned object key (key_schema 1, DECISIONS.md):
+// objectKey builds the versioned object key (key_schema 1, ADR-0005):
 //
 //	<prefix>/<engine>/<cluster>/<database>/<YYYY>/<MM>/<backup_id>.dump.zst.age
 //

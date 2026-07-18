@@ -21,6 +21,25 @@ type mysqlSource struct {
 	user     string
 	password string
 	database string
+	// sslMode is the normalized MySQL ssl-mode from the DSN query (REQUIRED,
+	// VERIFY_CA, ...); empty = not specified (driver/tool defaults). Managed
+	// providers create users with REQUIRE SSL — dropping this turns into a
+	// misleading 1045 Access denied even with the right password.
+	sslMode string
+}
+
+// mysqlSSLModes maps the DSN's ssl-mode (MySQL client semantics) onto
+// go-sql-driver's tls parameter. REQUIRED encrypts without verifying the
+// server certificate — exactly MySQL's meaning; verification starts at
+// VERIFY_CA ("true" also checks the hostname, i.e. VERIFY_IDENTITY — the
+// stricter reading is the safe one without a custom CA pool).
+var mysqlSSLModes = map[string]string{
+	"":                "", // not specified — driver default
+	"DISABLED":        "false",
+	"PREFERRED":       "preferred",
+	"REQUIRED":        "skip-verify",
+	"VERIFY_CA":       "true",
+	"VERIFY_IDENTITY": "true",
 }
 
 func parseMySQLDSN(dsn string) (mysqlSource, error) {
@@ -39,6 +58,11 @@ func parseMySQLDSN(dsn string) (mysqlSource, error) {
 	if port == "" {
 		port = "3306"
 	}
+	sslMode := strings.ToUpper(u.Query().Get("ssl-mode"))
+	if _, ok := mysqlSSLModes[sslMode]; !ok {
+		return mysqlSource{}, classify(KindConnect,
+			"pipeline: unsupported ssl-mode %q (use DISABLED, PREFERRED, REQUIRED, VERIFY_CA or VERIFY_IDENTITY)", sslMode)
+	}
 	pw, _ := u.User.Password()
 	return mysqlSource{
 		host:     u.Hostname(),
@@ -46,6 +70,7 @@ func parseMySQLDSN(dsn string) (mysqlSource, error) {
 		user:     u.User.Username(),
 		password: pw,
 		database: db,
+		sslMode:  sslMode,
 	}, nil
 }
 
@@ -58,7 +83,19 @@ func (s mysqlSource) goDSN() string {
 	cfg.Net = "tcp"
 	cfg.Addr = net.JoinHostPort(s.host, s.port)
 	cfg.DBName = s.database
+	if tls := mysqlSSLModes[s.sslMode]; tls != "" {
+		cfg.TLSConfig = tls
+	}
 	return cfg.FormatDSN()
+}
+
+// sslArgs are the --ssl-mode flags for mysqldump/mysql, mirroring what the
+// driver connection uses so the dump can't fail where the probe succeeded.
+func (s mysqlSource) sslArgs() []string {
+	if s.sslMode == "" {
+		return nil
+	}
+	return []string{"--ssl-mode=" + s.sslMode}
 }
 
 func (s mysqlSource) cluster() string {
@@ -179,8 +216,11 @@ func (d *mysqlDriver) ListDatabases(ctx context.Context) ([]DatabaseInfo, error)
 // and events (triggers travel with their tables and are on by default, made
 // explicit here). The password goes through MYSQL_PWD, never argv.
 func (d *mysqlDriver) BuildDumpCommand(ctx context.Context) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "mysqldump",
+	args := []string{
 		"-h", d.src.host, "-P", d.src.port, "-u", d.src.user, "--protocol=TCP",
+	}
+	args = append(args, d.src.sslArgs()...)
+	args = append(args,
 		"--single-transaction",
 		"--set-gtid-purged=OFF",
 		"--routines",
@@ -188,12 +228,15 @@ func (d *mysqlDriver) BuildDumpCommand(ctx context.Context) *exec.Cmd {
 		"--triggers",
 		d.src.database,
 	)
+	cmd := exec.CommandContext(ctx, "mysqldump", args...)
 	cmd.Env = append(os.Environ(), "MYSQL_PWD="+d.src.password)
 	return cmd
 }
 
 func (d *mysqlDriver) BuildRestoreCommand(targetDB string) []string {
-	return []string{"mysql", "-h", d.src.host, "-P", d.src.port, "-u", d.src.user, "--protocol=TCP", targetDB}
+	args := []string{"mysql", "-h", d.src.host, "-P", d.src.port, "-u", d.src.user, "--protocol=TCP"}
+	args = append(args, d.src.sslArgs()...)
+	return append(args, targetDB)
 }
 
 func (d *mysqlDriver) DumpFormat() string {

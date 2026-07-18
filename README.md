@@ -18,6 +18,7 @@ dumps each database separately, so you can restore one without touching the rest
 - PostgreSQL and MySQL; any S3-compatible destination (AWS S3, DigitalOcean
   Spaces, Cloudflare R2, Backblaze B2, MinIO)
 - Auto-discovers every database on the cluster; picks a matching `pg_dump`
+  (PostgreSQL 14–18 supported)
 
 ## Quickstart
 

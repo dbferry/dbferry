@@ -6,7 +6,7 @@ import (
 )
 
 // TestManifestKey pins the sidecar naming: same directory and backup_id as the
-// ciphertext object, with the suffix swapped (DECISIONS.md key schema).
+// ciphertext object, with the suffix swapped (ADR-0005 key schema).
 func TestManifestKey(t *testing.T) {
 	obj := "e2e/postgres/localhost_5417/src/2026/07/20260711T164025Z-01KX90TDX1XVMNBKV3GTF67CE3.dump.zst.age"
 	want := "e2e/postgres/localhost_5417/src/2026/07/20260711T164025Z-01KX90TDX1XVMNBKV3GTF67CE3.manifest.json"

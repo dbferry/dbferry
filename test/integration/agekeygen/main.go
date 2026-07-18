@@ -1,6 +1,6 @@
 // Command agekeygen generates a throwaway age identity for the integration
 // stand (poc-plan 0.2). It mirrors what a real customer does with `age-keygen`
-// under BYOK (see DECISIONS.md), so integration tests can encrypt to the
+// under BYOK (see ADR-0005), so integration tests can encrypt to the
 // recipient and decrypt on restore without a real key ever entering the repo.
 //
 // It writes two files into an output directory:

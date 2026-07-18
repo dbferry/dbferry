@@ -23,6 +23,17 @@ func TestParseMySQLDSN(t *testing.T) {
 			dsn:  "mysql://u@localhost/app",
 			want: mysqlSource{host: "localhost", port: "3306", user: "u", database: "app"},
 		},
+		{
+			name: "ssl-mode required (managed provider connection string)",
+			dsn:  "mysql://doadmin@db.example:25060/defaultdb?ssl-mode=REQUIRED",
+			want: mysqlSource{host: "db.example", port: "25060", user: "doadmin", database: "defaultdb", sslMode: "REQUIRED"},
+		},
+		{
+			name: "ssl-mode is case-insensitive",
+			dsn:  "mysql://u@h/app?ssl-mode=verify_ca",
+			want: mysqlSource{host: "h", port: "3306", user: "u", database: "app", sslMode: "VERIFY_CA"},
+		},
+		{name: "unknown ssl-mode", dsn: "mysql://u@h/app?ssl-mode=maybe", wantErr: "unsupported ssl-mode"},
 		{name: "missing database", dsn: "mysql://u:p@localhost:3306/", wantErr: "database name"},
 		{name: "wrong scheme", dsn: "postgres://u@localhost/app", wantErr: "not a MySQL URL"},
 	}
@@ -86,5 +97,48 @@ func TestMySQLDumpCommandKeepsSecretsOffArgv(t *testing.T) {
 	}
 	if !sawPwd {
 		t.Error("expected MYSQL_PWD in the command environment")
+	}
+}
+
+// TestMySQLSSLModeReachesDriverAndTools pins the TLS path end to end: the
+// DSN's ssl-mode must land in the go-sql-driver config AND on the
+// mysqldump/mysql argv — a user with REQUIRE SSL fails auth (1045) if it is
+// dropped anywhere.
+func TestMySQLSSLModeReachesDriverAndTools(t *testing.T) {
+	d, err := newMySQLDriver("mysql://doadmin:pw@h:25060/defaultdb?ssl-mode=REQUIRED")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.src.goDSN(); !strings.Contains(got, "tls=skip-verify") {
+		t.Errorf("driver DSN lost ssl-mode=REQUIRED (want tls=skip-verify): %q", got)
+	}
+	dump := strings.Join(d.BuildDumpCommand(context.Background()).Args, " ")
+	if !strings.Contains(dump, "--ssl-mode=REQUIRED") {
+		t.Errorf("mysqldump argv lost --ssl-mode: %q", dump)
+	}
+	restore := strings.Join(d.BuildRestoreCommand("target"), " ")
+	if !strings.Contains(restore, "--ssl-mode=REQUIRED") {
+		t.Errorf("restore argv lost --ssl-mode: %q", restore)
+	}
+
+	// VERIFY_* escalate to full verification in the driver.
+	d2, err := newMySQLDriver("mysql://u:p@h/app?ssl-mode=VERIFY_IDENTITY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d2.src.goDSN(); !strings.Contains(got, "tls=true") {
+		t.Errorf("VERIFY_IDENTITY should map to tls=true: %q", got)
+	}
+
+	// No ssl-mode = today's behavior, untouched.
+	d3, err := newMySQLDriver("mysql://u:p@h/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d3.src.goDSN(); strings.Contains(got, "tls=") {
+		t.Errorf("DSN without ssl-mode must not set tls: %q", got)
+	}
+	if plain := strings.Join(d3.BuildDumpCommand(context.Background()).Args, " "); strings.Contains(plain, "--ssl-mode") {
+		t.Errorf("dump argv without ssl-mode must not carry the flag: %q", plain)
 	}
 }

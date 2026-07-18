@@ -40,7 +40,7 @@ func TestParseDest(t *testing.T) {
 	}
 }
 
-// TestObjectKeySchema pins the versioned key schema (key_schema 1, DECISIONS.md).
+// TestObjectKeySchema pins the versioned key schema (key_schema 1, ADR-0005).
 // This is a public contract with the customer; a change here means a new schema
 // version, not an edit to this test.
 func TestObjectKeySchema(t *testing.T) {

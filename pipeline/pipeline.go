@@ -17,7 +17,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Defaults for the S3 multipart upload, fixed in DECISIONS.md (2026-07-11):
+// Defaults for the S3 multipart upload, fixed in ADR-0005:
 // part size 32 MiB × concurrency 4 keeps in-flight buffers around 128 MiB, half
 // of the 256 MiB RSS budget. The 10k-part S3 limit then caps one object at
 // ~312 GiB; hitting it is a controlled error before Complete, never a corrupt
@@ -41,7 +41,7 @@ type Config struct {
 	// Dest is the destination URL, e.g. s3://bucket/prefix.
 	Dest string
 	// AgeRecipient is the age public recipient the backup is encrypted to
-	// (BYOK: we never hold the private key — see DECISIONS.md).
+	// (BYOK: we never hold the private key — see ADR-0005).
 	AgeRecipient string
 	// S3Endpoint, when non-empty, points at an S3-compatible endpoint (e.g.
 	// MinIO) and switches the client to path-style addressing. Empty means
@@ -91,7 +91,7 @@ type Result struct {
 	// BackupID is the unique id (UTC timestamp + ULID) embedded in the key.
 	BackupID string
 	// Bucket and Key locate the ciphertext object per the versioned key
-	// schema (DECISIONS.md); ManifestKey is its .manifest.json sibling.
+	// schema (ADR-0005); ManifestKey is its .manifest.json sibling.
 	Bucket      string
 	Key         string
 	ManifestKey string
@@ -251,7 +251,7 @@ func Run(ctx context.Context, cfg Config) (res Result, err error) {
 	phase.Store(int32(PhaseFinalizing))
 
 	// The object is now complete. Write the manifest that makes it a valid
-	// backup — only now, never before (DECISIONS.md invariant). If this fails
+	// backup — only now, never before (ADR-0005 invariant). If this fails
 	// the object is an orphan without a manifest: Run must NOT report success,
 	// leaving it for reconciliation/cleanup (poc-plan 2.4).
 	mkey := manifestKey(key)

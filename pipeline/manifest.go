@@ -8,7 +8,7 @@ import (
 )
 
 // keySchemaVersion is the version of the object-key + manifest contract
-// (DECISIONS.md). It is written into every manifest; the layout may only change
+// (ADR-0005). It is written into every manifest; the layout may only change
 // by bumping this, never by editing the meaning of an existing version.
 const keySchemaVersion = 1
 
@@ -18,7 +18,7 @@ const backupFormat = "pg_dump -Fc -Z0 | zstd | age"
 
 // Manifest is the JSON sidecar written next to a completed backup object. A
 // backup is valid only with its manifest, and the manifest is written only
-// after the object's multipart upload completes (DECISIONS.md). Field names are
+// after the object's multipart upload completes (ADR-0005). Field names are
 // part of the versioned public contract — change them only via keySchemaVersion.
 type Manifest struct {
 	KeySchema        int    `json:"key_schema"`
@@ -38,7 +38,7 @@ type Manifest struct {
 }
 
 // manifestKey is the manifest's object key: the sibling of the ciphertext key
-// with the .dump.zst.age suffix replaced by .manifest.json (DECISIONS.md).
+// with the .dump.zst.age suffix replaced by .manifest.json (ADR-0005).
 func manifestKey(objectKey string) string {
 	return strings.TrimSuffix(objectKey, ciphertextSuffix) + manifestSuffix
 }

@@ -12,7 +12,7 @@ import (
 )
 
 // Supported PostgreSQL server major range. Outside it, dbferry refuses before
-// starting a dump (poc-plan 5.3), because the shipped pg_dump clients (14–17)
+// starting a dump (poc-plan 5.3), because the shipped pg_dump clients (14–18)
 // can't be guaranteed to produce a restorable dump.
 const (
 	minSupportedPGMajor = 14
