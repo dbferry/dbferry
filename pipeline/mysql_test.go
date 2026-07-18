@@ -84,7 +84,7 @@ func TestMySQLDumpCommandKeepsSecretsOffArgv(t *testing.T) {
 		}
 	}
 	joined := strings.Join(cmd.Args, " ")
-	for _, f := range []string{"--single-transaction", "--set-gtid-purged=OFF", "--routines", "--events"} {
+	for _, f := range []string{"--single-transaction", "--set-gtid-purged=OFF", "--no-tablespaces", "--routines", "--events"} {
 		if !strings.Contains(joined, f) {
 			t.Errorf("dump command missing %s: %q", f, cmd.Args)
 		}

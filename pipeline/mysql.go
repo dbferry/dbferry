@@ -223,6 +223,10 @@ func (d *mysqlDriver) BuildDumpCommand(ctx context.Context) *exec.Cmd {
 	args = append(args,
 		"--single-transaction",
 		"--set-gtid-purged=OFF",
+		// Without it, mysqldump 8.0.21+ demands global PROCESS just to dump
+		// tablespace definitions nobody on managed MySQL uses — and PROCESS
+		// would let the backup role see every running query.
+		"--no-tablespaces",
 		"--routines",
 		"--events",
 		"--triggers",
@@ -240,7 +244,7 @@ func (d *mysqlDriver) BuildRestoreCommand(targetDB string) []string {
 }
 
 func (d *mysqlDriver) DumpFormat() string {
-	return "mysqldump --single-transaction --set-gtid-purged=OFF --routines --events | zstd | age"
+	return "mysqldump --single-transaction --set-gtid-purged=OFF --no-tablespaces --routines --events | zstd | age"
 }
 
 func (d *mysqlDriver) DumpClientVersion(ctx context.Context) string {

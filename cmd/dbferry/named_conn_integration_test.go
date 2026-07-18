@@ -13,6 +13,15 @@ import (
 	"github.com/dbferry/dbferry/config"
 )
 
+// testS3Endpoint honors DBFERRY_TEST_S3_ENDPOINT like the integration suite
+// (dev machines where localhost:9000 is shadowed need a LAN address).
+func testS3Endpoint() string {
+	if v := os.Getenv("DBFERRY_TEST_S3_ENDPOINT"); v != "" {
+		return v
+	}
+	return "http://localhost:9000"
+}
+
 // TestRunAndDoctorViaConnection drives the whole named-connection path end to
 // end against the stand: build a config, then `run --connection` and
 // `doctor --connection` (poc-plan 0.5.6). Needs `make stand-up`.
@@ -42,7 +51,7 @@ func TestRunAndDoctorViaConnection(t *testing.T) {
 		Destinations: map[string]*config.Destination{
 			"minio": {
 				Bucket: "dbferry-backups", Prefix: "cmdit",
-				Endpoint: "http://localhost:9000", Region: "us-east-1",
+				Endpoint: testS3Endpoint(), Region: "us-east-1",
 				AccessKey: &config.SecretRef{Env: "MINIO_KEY"},
 				SecretKey: &config.SecretRef{Env: "MINIO_SECRET"},
 			},

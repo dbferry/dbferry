@@ -102,6 +102,66 @@ func (d *postgresDriver) DumpClientVersion(ctx context.Context) string {
 	return pgDumpVersionOf(ctx, d.pgDump())
 }
 
+// checkReadAccess reports what the current role cannot read and pg_dump
+// would therefore fail on: tables, and large objects — whose per-object
+// ACLs no role-level grant (pg_read_all_data included) covers.
+func (d *postgresDriver) checkReadAccess(ctx context.Context) []Check {
+	conn, err := pgx.Connect(ctx, d.dsn)
+	if err != nil {
+		return []Check{{Name: "table read access", Status: StatusFail, Detail: err.Error()}}
+	}
+	defer conn.Close(ctx)
+
+	checks := []Check{}
+
+	var unreadable int
+	var sample string
+	err = conn.QueryRow(ctx, `
+		SELECT count(*),
+		       coalesce(min(n.nspname || '.' || c.relname), '')
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r', 'p', 'm')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		  AND NOT n.nspname LIKE 'pg_toast%'
+		  AND NOT has_table_privilege(c.oid, 'SELECT')`).Scan(&unreadable, &sample)
+	switch {
+	case err != nil:
+		checks = append(checks, Check{Name: "table read access", Status: StatusWarn,
+			Detail: "could not verify per-table privileges: " + err.Error()})
+	case unreadable > 0:
+		checks = append(checks, Check{Name: "table read access", Status: StatusFail,
+			Detail: fmt.Sprintf("%d table(s) not readable by this role (e.g. %s) — pg_dump will fail on them", unreadable, sample),
+			Fix:    "grant SELECT on those tables (or grant the pg_read_all_data role)"})
+	default:
+		checks = append(checks, Check{Name: "table read access", Status: StatusOK, Detail: "every table is readable"})
+	}
+
+	// Large objects are dumped by default and read through their own ACLs:
+	// unreadable means owned by another role with no SELECT granted to this
+	// one (directly or via PUBLIC). NULL lomacl is the default owner-only ACL.
+	var loCount int
+	var loSample string
+	err = conn.QueryRow(ctx, `
+		SELECT count(*), coalesce(min(m.oid)::text, '')
+		FROM pg_largeobject_metadata m
+		WHERE NOT pg_has_role(m.lomowner, 'USAGE')
+		  AND (m.lomacl IS NULL OR NOT EXISTS (
+		        SELECT 1 FROM aclexplode(m.lomacl) a
+		        WHERE a.privilege_type = 'SELECT'
+		          AND (a.grantee = 0 OR pg_has_role(a.grantee, 'USAGE'))))`).Scan(&loCount, &loSample)
+	switch {
+	case err != nil:
+		checks = append(checks, Check{Name: "large object read access", Status: StatusWarn,
+			Detail: "could not verify large object privileges: " + err.Error()})
+	case loCount > 0:
+		checks = append(checks, Check{Name: "large object read access", Status: StatusFail,
+			Detail: fmt.Sprintf("%d large object(s) not readable by this role (e.g. oid %s) — pg_dump includes large objects and will fail on them", loCount, loSample),
+			Fix:    "GRANT SELECT ON LARGE OBJECT <oid> TO the role per object (PostgreSQL has no bulk large-object grant), or change their owner"})
+	}
+	return checks
+}
+
 func (d *postgresDriver) Diagnose(ctx context.Context) []Check {
 	major, err := postgresServerMajor(ctx, d.dsn)
 	if err != nil {
@@ -127,5 +187,11 @@ func (d *postgresDriver) Diagnose(ctx context.Context) []Check {
 		checks = append(checks, Check{Name: "pg_dump client", Status: StatusOK,
 			Detail: fmt.Sprintf("pg_dump %d (matches server)", client.major)})
 	}
+
+	// Dump-level permissions: pg_dump reads EVERY table and large object of
+	// the connected database — a connect-only role passes the checks above
+	// and then fails mid-dump. Count what the role cannot read so the
+	// doctor says it now.
+	checks = append(checks, d.checkReadAccess(ctx)...)
 	return checks
 }

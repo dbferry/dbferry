@@ -9,15 +9,18 @@ import (
 func TestPostgresGrants(t *testing.T) {
 	sql := PostgresGrants("dbferry_backup", "shop")
 	for _, want := range []string{
-		`CREATE ROLE "dbferry_backup" LOGIN PASSWORD`,
+		`CREATE ROLE "dbferry_backup" LOGIN;`,
+		`\password "dbferry_backup"`, // interactive — never a literal in SQL
+		`GRANT pg_read_all_data TO "dbferry_backup"`,
 		`GRANT CONNECT ON DATABASE "shop" TO "dbferry_backup"`,
-		`GRANT SELECT ON ALL TABLES IN SCHEMA public TO "dbferry_backup"`,
-		`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES`,
-		`pg_read_all_data`,
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("postgres grants miss %q", want)
 		}
+	}
+	// The password never appears as a SQL literal (quoting/injection-proof).
+	if strings.Contains(sql, "PASSWORD '") {
+		t.Error("postgres grants embed a password literal")
 	}
 	// No write privilege sneaks in.
 	for _, banned := range []string{"INSERT", "UPDATE ", "DELETE", "CREATE TABLE", "SUPERUSER"} {
@@ -34,7 +37,7 @@ func TestPostgresGrants(t *testing.T) {
 func TestMySQLGrants(t *testing.T) {
 	sql := MySQLGrants("dbferry_backup", "shop")
 	for _, want := range []string{
-		"CREATE USER 'dbferry_backup'@'%'",
+		"CREATE USER 'dbferry_backup'@'%' IDENTIFIED BY RANDOM PASSWORD",
 		"GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON `shop`.*",
 		"GRANT SHOW_ROUTINE ON *.*",
 	} {
@@ -42,19 +45,42 @@ func TestMySQLGrants(t *testing.T) {
 			t.Errorf("mysql grants miss %q", want)
 		}
 	}
-	// LOCK TABLES is deliberately absent: --single-transaction needs none.
-	if strings.Contains(sql, "LOCK TABLES") {
-		t.Error("mysql grants contain LOCK TABLES — not needed with --single-transaction")
-	}
-	for _, banned := range []string{"INSERT", "UPDATE", "DELETE", "ALL PRIVILEGES"} {
+	// Neither LOCK TABLES (--single-transaction) nor PROCESS
+	// (--no-tablespaces) may appear, and no password literal exists.
+	for _, banned := range []string{"LOCK TABLES", "PROCESS", "IDENTIFIED BY '", "INSERT", "UPDATE", "DELETE", "ALL PRIVILEGES"} {
 		if strings.Contains(sql, banned) {
-			t.Errorf("mysql grants contain %q — more than read-only", banned)
+			t.Errorf("mysql grants contain %q", banned)
+		}
+	}
+	// Hostile usernames: quote AND backslash escaping.
+	q := MySQLGrants(`o'malley\`, "d`b")
+	if !strings.Contains(q, `'o''malley\\'`) {
+		t.Errorf("mysql username escaping broken: %s", q)
+	}
+	if !strings.Contains(q, "`d``b`") {
+		t.Errorf("mysql database quoting broken: %s", q)
+	}
+}
+
+func TestValidatePrefix(t *testing.T) {
+	for _, bad := range []string{"a*", "a?b", "a//b", "a/../b", "..", "."} {
+		if _, err := ValidatePrefix(bad); err == nil {
+			t.Errorf("prefix %q accepted", bad)
+		}
+	}
+	for raw, want := range map[string]string{"/a/b/": "a/b", "": "", "dbferry": "dbferry"} {
+		got, err := ValidatePrefix(raw)
+		if err != nil || got != want {
+			t.Errorf("ValidatePrefix(%q) = %q, %v; want %q", raw, got, err, want)
 		}
 	}
 }
 
 func TestS3Policy(t *testing.T) {
-	pol := S3Policy("my-bucket", "backups", true)
+	pol, err := S3Policy("my-bucket", "backups", true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var parsed struct {
 		Statement []struct {
 			Action   []string `json:"Action"`
@@ -84,14 +110,31 @@ func TestS3Policy(t *testing.T) {
 	}
 
 	// Without delete: append-only, no DeleteObject anywhere.
-	appendOnly := S3Policy("my-bucket", "backups", false)
+	appendOnly, err := S3Policy("my-bucket", "backups", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(appendOnly, "DeleteObject") {
 		t.Error("append-only policy still grants DeleteObject")
 	}
 
 	// Empty prefix scopes objects to the whole bucket.
-	whole := S3Policy("b", "", true)
+	whole, err := S3Policy("b", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(whole, `"arn:aws:s3:::b/*"`) {
 		t.Errorf("empty prefix policy: %s", whole)
+	}
+
+	// Wildcards and navigation are refused outright — a user-supplied `*`
+	// must never become an IAM wildcard.
+	for _, bad := range []string{"a*", "a/../b"} {
+		if _, err := S3Policy("b", bad, true); err == nil {
+			t.Errorf("policy accepted hostile prefix %q", bad)
+		}
+	}
+	if _, err := S3Policy("bad*bucket", "p", true); err == nil {
+		t.Error("policy accepted a wildcard bucket name")
 	}
 }
