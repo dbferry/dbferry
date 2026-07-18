@@ -11,6 +11,7 @@ dbferry — per-database backups for managed PostgreSQL/MySQL. Each database is 
 - `cmd/dbferry/` — the CLI (hand-rolled `flag` parsing + a command switch, no framework): `init`, `run`, `databases`, `test-connection`, `doctor`, `connections`/`destinations`, `keygen`.
 - `config/` — named connections and destinations: TOML config, password-free DSN templates (`BuildDSN`/`ValidateDSNTemplate`), secrets via OS keyring or env refs (ADR-0004), redaction.
 - `pipeline/` — the streaming pipeline, `DatabaseDriver` implementations (Postgres 14–18, MySQL), discovery, preflight, diagnostics, manifests/object keys (ADR-0005), and the GFS retention machinery (`ListBackups` / `SelectRetention` / `Prune`) — currently exported for the cloud server only; a `dbferry prune` CLI command is planned but not wired yet.
+- `onboard/` — least-privilege access generators: read-only DB grants (PG/MySQL, exactly what the dump invocations need) and the prefix-scoped S3 policy — used by the cloud wizard, future `dbferry init` material.
 - `test/integration/` — the docker stand (PostgreSQL 14 + 17, MySQL 8, MinIO + bucket, throwaway age identity).
 
 ## Commands
