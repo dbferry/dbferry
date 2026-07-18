@@ -7,7 +7,10 @@ import (
 )
 
 func TestPostgresGrants(t *testing.T) {
-	sql := PostgresGrants("dbferry_backup", "shop")
+	sql, err := PostgresGrants("dbferry_backup", "shop")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
 		`CREATE ROLE "dbferry_backup" LOGIN;`,
 		`\password "dbferry_backup"`, // interactive — never a literal in SQL
@@ -29,13 +32,32 @@ func TestPostgresGrants(t *testing.T) {
 		}
 	}
 	// Identifier quoting survives hostile names.
-	if q := PostgresGrants(`we"ird`, `d"b`); !strings.Contains(q, `"we""ird"`) || !strings.Contains(q, `"d""b"`) {
+	q, err := PostgresGrants(`we"ird`, `d"b`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(q, `"we""ird"`) || !strings.Contains(q, `"d""b"`) {
 		t.Errorf("identifier quoting broken: %s", q)
+	}
+	// Control characters are refused outright: a newline in a role name
+	// would break out of the line-based \password meta-command.
+	for _, bad := range [][2]string{
+		{"evil\n\\! rm -rf /", "shop"},
+		{"backup", "sh\nop"},
+		{"", "shop"},
+		{"backup", ""},
+	} {
+		if _, err := PostgresGrants(bad[0], bad[1]); err == nil {
+			t.Errorf("postgres grants accepted hostile identifiers %q/%q", bad[0], bad[1])
+		}
 	}
 }
 
 func TestMySQLGrants(t *testing.T) {
-	sql := MySQLGrants("dbferry_backup", "shop")
+	sql, err := MySQLGrants("dbferry_backup", "shop")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
 		"CREATE USER 'dbferry_backup'@'%' IDENTIFIED BY RANDOM PASSWORD",
 		"GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON `shop`.*",
@@ -53,17 +75,29 @@ func TestMySQLGrants(t *testing.T) {
 		}
 	}
 	// Hostile usernames: quote AND backslash escaping.
-	q := MySQLGrants(`o'malley\`, "d`b")
+	q, err := MySQLGrants(`o'malley\`, "d`b")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(q, `'o''malley\\'`) {
 		t.Errorf("mysql username escaping broken: %s", q)
 	}
 	if !strings.Contains(q, "`d``b`") {
 		t.Errorf("mysql database quoting broken: %s", q)
 	}
+	// Control characters and empty names are refused.
+	for _, bad := range [][2]string{{"u\nser", "shop"}, {"backup", "s\thop"}, {"", "shop"}, {"backup", ""}} {
+		if _, err := MySQLGrants(bad[0], bad[1]); err == nil {
+			t.Errorf("mysql grants accepted hostile identifiers %q/%q", bad[0], bad[1])
+		}
+	}
 }
 
 func TestValidatePrefix(t *testing.T) {
-	for _, bad := range []string{"a*", "a?b", "a//b", "a/../b", "..", "."} {
+	// Percent signs are banned as a class: the pipeline URL-parses the
+	// destination, so team%2Fprod / %2e%2e / %2a would decode into exactly
+	// the separators and wildcards the literal checks reject.
+	for _, bad := range []string{"a*", "a?b", "a//b", "a/../b", "..", ".", "team%2Fprod", "%2e%2e", "a%2ab", "100%", "a\nb"} {
 		if _, err := ValidatePrefix(bad); err == nil {
 			t.Errorf("prefix %q accepted", bad)
 		}

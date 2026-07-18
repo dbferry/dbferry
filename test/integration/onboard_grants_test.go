@@ -58,7 +58,11 @@ func TestGeneratedPostgresGrantsRunARealDump(t *testing.T) {
 		`INSERT INTO app2.notes VALUES (1, 'second-schema-data')`,
 	)
 
-	for _, stmt := range stripToStatements(onboard.PostgresGrants(user, srcDB)) {
+	script, err := onboard.PostgresGrants(user, srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range stripToStatements(script) {
 		if _, err := admin.Exec(stmt); err != nil {
 			t.Fatalf("apply %q: %v", stmt, err)
 		}
@@ -112,7 +116,11 @@ func TestDoctorFlagsUnreadableLargeObjects(t *testing.T) {
 	srcAdmin := openPG(t, dsnWithDB(t, pg17DSN, srcDB))
 	pgExec(t, srcAdmin, `SELECT lo_from_bytea(0, 'admin-owned blob')`)
 
-	for _, stmt := range stripToStatements(onboard.PostgresGrants(user, srcDB)) {
+	script, err := onboard.PostgresGrants(user, srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range stripToStatements(script) {
 		if _, err := admin.Exec(stmt); err != nil {
 			t.Fatalf("apply %q: %v", stmt, err)
 		}
@@ -135,6 +143,48 @@ func TestDoctorFlagsUnreadableLargeObjects(t *testing.T) {
 	if loCheck.Status != pipeline.StatusFail {
 		t.Fatalf("large object check = %s (%s), want fail", loCheck.Status, loCheck.Detail)
 	}
+}
+
+// TestDoctorFlagsUnreadableSequences pins the sequence half of the read
+// check: pg_dump reads sequence state, so a role with SELECT on every table
+// but no privilege on a sequence must fail the doctor, not surprise the
+// first backup.
+func TestDoctorFlagsUnreadableSequences(t *testing.T) {
+	suffix := uniqueSuffix()
+	srcDB := "it_seq_" + suffix
+	user := "it_seq_role_" + suffix
+	password := "it-seq-pass"
+
+	admin := openPG(t, pg17DSN)
+	loadPGFixture(t, admin, pg17DSN, srcDB)
+	t.Cleanup(func() {
+		admin.Exec(`DROP DATABASE IF EXISTS "` + srcDB + `" WITH (FORCE)`)
+		admin.Exec(`DROP ROLE IF EXISTS "` + user + `"`)
+	})
+
+	// Hand-rolled naive grants (NOT the generated snippet): tables covered,
+	// the sequence forgotten.
+	srcAdmin := openPG(t, dsnWithDB(t, pg17DSN, srcDB))
+	pgExec(t, srcAdmin, `CREATE SEQUENCE public.orders_seq`)
+	pgExec(t, admin, fmt.Sprintf(`CREATE ROLE "%s" LOGIN PASSWORD '%s'`, user, password))
+	pgExec(t, srcAdmin,
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE "%s" TO "%s"`, srcDB, user),
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO "%s"`, user),
+		fmt.Sprintf(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO "%s"`, user),
+	)
+
+	dsn := strings.Replace(dsnWithDB(t, pg17DSN, srcDB), "dbferry:dbferry@", user+":"+password+"@", 1)
+	for _, c := range pipeline.DiagnoseSource(context.Background(), dsn) {
+		if c.Name == "table read access" {
+			// Every table IS readable — only sequences can be in the
+			// unreadable set, so a failure here is the sequence gap.
+			if c.Status != pipeline.StatusFail || !strings.Contains(c.Detail, "sequence") {
+				t.Fatalf("sequence gap not flagged: %s — %s", c.Status, c.Detail)
+			}
+			return
+		}
+	}
+	t.Fatal("doctor has no table read access check")
 }
 
 // TestGeneratedMySQLGrantsRunARealDump pins the MySQL side: a user created
@@ -169,7 +219,11 @@ func TestGeneratedMySQLGrantsRunARealDump(t *testing.T) {
 	// Apply the generated grants, replacing RANDOM PASSWORD with a known one
 	// (the server-side generation is interactive output a test cannot read).
 	password := "it-grants-pass"
-	script := strings.ReplaceAll(onboard.MySQLGrants(user, srcDB),
+	generated, err := onboard.MySQLGrants(user, srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(generated,
 		"IDENTIFIED BY RANDOM PASSWORD", "IDENTIFIED BY '"+password+"'")
 	for _, stmt := range stripToStatements(script) {
 		mustExec(stmt)

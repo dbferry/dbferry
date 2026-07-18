@@ -114,6 +114,8 @@ func (d *postgresDriver) checkReadAccess(ctx context.Context) []Check {
 
 	checks := []Check{}
 
+	// Tables need SELECT; sequences need SELECT or USAGE (pg_dump reads
+	// their state with a plain SELECT, which either privilege allows).
 	var unreadable int
 	var sample string
 	err = conn.QueryRow(ctx, `
@@ -121,20 +123,21 @@ func (d *postgresDriver) checkReadAccess(ctx context.Context) []Check {
 		       coalesce(min(n.nspname || '.' || c.relname), '')
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.relkind IN ('r', 'p', 'm')
-		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
 		  AND NOT n.nspname LIKE 'pg_toast%'
-		  AND NOT has_table_privilege(c.oid, 'SELECT')`).Scan(&unreadable, &sample)
+		  AND ((c.relkind IN ('r', 'p', 'm') AND NOT has_table_privilege(c.oid, 'SELECT'))
+		    OR (c.relkind = 'S' AND NOT has_sequence_privilege(c.oid, 'SELECT')
+		                        AND NOT has_sequence_privilege(c.oid, 'USAGE')))`).Scan(&unreadable, &sample)
 	switch {
 	case err != nil:
 		checks = append(checks, Check{Name: "table read access", Status: StatusWarn,
 			Detail: "could not verify per-table privileges: " + err.Error()})
 	case unreadable > 0:
 		checks = append(checks, Check{Name: "table read access", Status: StatusFail,
-			Detail: fmt.Sprintf("%d table(s) not readable by this role (e.g. %s) — pg_dump will fail on them", unreadable, sample),
-			Fix:    "grant SELECT on those tables (or grant the pg_read_all_data role)"})
+			Detail: fmt.Sprintf("%d table(s)/sequence(s) not readable by this role (e.g. %s) — pg_dump will fail on them", unreadable, sample),
+			Fix:    "grant SELECT on those tables/sequences (or grant the pg_read_all_data role)"})
 	default:
-		checks = append(checks, Check{Name: "table read access", Status: StatusOK, Detail: "every table is readable"})
+		checks = append(checks, Check{Name: "table read access", Status: StatusOK, Detail: "every table and sequence is readable"})
 	}
 
 	// Large objects are dumped by default and read through their own ACLs:
