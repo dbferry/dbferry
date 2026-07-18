@@ -163,7 +163,9 @@ func TestDoctorFlagsUnreadableSequences(t *testing.T) {
 	})
 
 	// Hand-rolled naive grants (NOT the generated snippet): tables covered,
-	// the sequence forgotten.
+	// the sequence given only USAGE — the trap case: USAGE permits
+	// currval/nextval but NOT the plain SELECT pg_dump issues, so this must
+	// fail, not look green.
 	srcAdmin := openPG(t, dsnWithDB(t, pg17DSN, srcDB))
 	pgExec(t, srcAdmin, `CREATE SEQUENCE public.orders_seq`)
 	pgExec(t, admin, fmt.Sprintf(`CREATE ROLE "%s" LOGIN PASSWORD '%s'`, user, password))
@@ -171,9 +173,18 @@ func TestDoctorFlagsUnreadableSequences(t *testing.T) {
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE "%s" TO "%s"`, srcDB, user),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO "%s"`, user),
 		fmt.Sprintf(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO "%s"`, user),
+		fmt.Sprintf(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO "%s"`, user),
 	)
 
 	dsn := strings.Replace(dsnWithDB(t, pg17DSN, srcDB), "dbferry:dbferry@", user+":"+password+"@", 1)
+
+	// Premise: the exact read pg_dump performs is denied for USAGE-only.
+	roleDB := openPG(t, dsn)
+	var lastValue int64
+	if err := roleDB.QueryRow(`SELECT last_value FROM public.orders_seq`).Scan(&lastValue); err == nil {
+		t.Fatal("USAGE-only sequence unexpectedly readable — test premise broken")
+	}
+
 	for _, c := range pipeline.DiagnoseSource(context.Background(), dsn) {
 		if c.Name == "table read access" {
 			// Every table IS readable — only sequences can be in the

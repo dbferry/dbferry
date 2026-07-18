@@ -114,8 +114,9 @@ func (d *postgresDriver) checkReadAccess(ctx context.Context) []Check {
 
 	checks := []Check{}
 
-	// Tables need SELECT; sequences need SELECT or USAGE (pg_dump reads
-	// their state with a plain SELECT, which either privilege allows).
+	// Tables and sequences both need SELECT: pg_dump reads sequence state
+	// with a plain SELECT, and sequence USAGE only permits currval/nextval —
+	// a USAGE-only grant still fails the dump.
 	var unreadable int
 	var sample string
 	err = conn.QueryRow(ctx, `
@@ -126,8 +127,7 @@ func (d *postgresDriver) checkReadAccess(ctx context.Context) []Check {
 		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
 		  AND NOT n.nspname LIKE 'pg_toast%'
 		  AND ((c.relkind IN ('r', 'p', 'm') AND NOT has_table_privilege(c.oid, 'SELECT'))
-		    OR (c.relkind = 'S' AND NOT has_sequence_privilege(c.oid, 'SELECT')
-		                        AND NOT has_sequence_privilege(c.oid, 'USAGE')))`).Scan(&unreadable, &sample)
+		    OR (c.relkind = 'S' AND NOT has_sequence_privilege(c.oid, 'SELECT')))`).Scan(&unreadable, &sample)
 	switch {
 	case err != nil:
 		checks = append(checks, Check{Name: "table read access", Status: StatusWarn,
