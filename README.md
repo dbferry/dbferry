@@ -77,6 +77,13 @@ Restore is the inverse chain, documented step by step (download → `age -d` →
 - [Operating backups](docs/operations.md) — bucket lifecycle for incomplete uploads
 - [Architecture decisions](docs/adr)
 
+## Security
+
+Found a vulnerability? Please report it privately — see [`SECURITY.md`](SECURITY.md).
+Backups are encrypted client-side with your own age key; dbferry never holds it.
+
 ## License
 
-TBD (open-core: this CLI will be free forever).
+[Apache License 2.0](LICENSE) — free forever. dbferry is open-core: this CLI and
+the backup pipeline are open source; the hosted control plane that schedules and
+manages them is a separate commercial product.
