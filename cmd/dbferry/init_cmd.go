@@ -148,6 +148,13 @@ func cmdInit(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool)
 			return 1
 		}
 	}
+	unlock, err := config.Lock(path)
+	if err != nil {
+		_ = pwRef.Delete()
+		fmt.Fprintln(stderr, "dbferry: "+err.Error())
+		return 1
+	}
+	defer unlock()
 	cfg, err := config.Load(path)
 	if err != nil {
 		_ = pwRef.Delete()
@@ -155,7 +162,7 @@ func cmdInit(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool)
 		return 1
 	}
 	cfg.Connections[name] = conn
-	if err := cfg.Save(path); err != nil {
+	if err := cfg.SaveLocked(path); err != nil {
 		_ = pwRef.Delete()
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
@@ -172,6 +179,14 @@ func cmdInit(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool)
 // chooseDestination lets the user pick an existing destination or create one,
 // then probes it (write/read/delete).
 func chooseDestination(cfgPath string, stderr io.Writer) (string, error) {
+	// Hold the config lock across the whole choose-or-create (interactive, so
+	// released only when this returns); the surrounding init save re-locks
+	// afterwards, sequentially.
+	unlock, err := config.Lock(cfgPath)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return "", err
@@ -203,7 +218,7 @@ func chooseDestination(cfgPath string, stderr io.Writer) (string, error) {
 		return "", err
 	}
 	cfg.Destinations[name] = dst
-	if err := cfg.Save(cfgPath); err != nil {
+	if err := cfg.SaveLocked(cfgPath); err != nil {
 		return "", err
 	}
 

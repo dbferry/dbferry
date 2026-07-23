@@ -38,7 +38,17 @@ func (conn *Connection) withPassword(database string) (string, []string, error) 
 	if err != nil {
 		return "", nil, err
 	}
-	return dsn, []string{pw}, nil
+	// Redact both the raw password and its URL-encoded form: BuildDSN injects
+	// it via url.UserPassword, so in the connectable DSN a password like `p@ss`
+	// appears percent-encoded (`p%40ss`). Registering only the raw value would
+	// let the encoded form slip through if the full DSN ever reached an error
+	// or log. (Redacting the encoded password, not the whole DSN, keeps the
+	// host/db visible for diagnostics.)
+	secrets := []string{pw}
+	if enc := strings.TrimPrefix(url.UserPassword("", pw).String(), ":"); enc != "" && enc != pw {
+		secrets = append(secrets, enc)
+	}
+	return dsn, secrets, nil
 }
 
 // BuildDSN renders a password-stripped DSN template into a connectable DSN:

@@ -74,11 +74,21 @@ func newS3Client(ctx context.Context, cfg Config) (*s3.Client, error) {
 		return nil, classify(KindUpload, "load AWS config: %w", err)
 	}
 	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		// Disable the SDK's default-integrity per-part checksums for EVERY
+		// target, not only S3-compatible endpoints. We do manual multipart and
+		// build each CompletedPart with just ETag+PartNumber; with the v2 SDK
+		// default (RequestChecksumCalculationWhenSupported) the SDK adds a CRC32
+		// to each UploadPart, and real AWS S3 then rejects CompleteMultipartUpload
+		// ("the complete request must include the checksum for each part").
+		// End-to-end integrity is the manifest's ciphertext SHA-256, so the
+		// per-part checksum is redundant. This branch used to be gated on
+		// S3Endpoint, which silently broke every backup to a customer's own AWS
+		// bucket (the headline use case) while MinIO CI stayed green (ADR-0003).
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		if cfg.S3Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.S3Endpoint)
 			o.UsePathStyle = true
-			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	}), nil
 }

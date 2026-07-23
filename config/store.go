@@ -77,21 +77,48 @@ func Load(path string) (*Config, error) {
 // Save writes the config atomically: serialize first (so a marshal error leaves
 // the old file untouched), then write to a temp file in the same directory with
 // fsync and rename into place, all under a file lock against concurrent writers.
+//
+// Save takes the lock only for the write itself. A command that reads, mutates
+// and writes must instead hold the lock across the whole sequence with Lock +
+// SaveLocked, or two concurrent invocations each read the old file and the
+// second write silently clobbers the first's change (lost update).
 func (c *Config) Save(path string) error {
+	unlock, err := Lock(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return c.SaveLocked(path)
+}
+
+// Lock acquires the exclusive config lock (creating the config directory if
+// needed) and returns a release function. Hold it across a Load → mutate →
+// SaveLocked sequence to serialize read-modify-write against other dbferry
+// processes; the lock is advisory (flock) and process-scoped.
+func Lock(path string) (unlock func(), err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	lock := flock.New(path + ".lock")
+	locked, err := lock.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("lock config: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("config %s is locked by another dbferry process; retry shortly", path)
+	}
+	return func() { _ = lock.Unlock() }, nil
+}
+
+// SaveLocked writes the config atomically WITHOUT taking the lock: the caller
+// must already hold it via Lock. Same durability as Save (serialize → temp file
+// → fsync → atomic rename).
+func (c *Config) SaveLocked(path string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-
-	lock := flock.New(path + ".lock")
-	locked, err := lock.TryLock()
-	if err != nil {
-		return fmt.Errorf("lock config: %w", err)
-	}
-	if !locked {
-		return fmt.Errorf("config %s is locked by another dbferry process; retry shortly", path)
-	}
-	defer lock.Unlock()
 
 	b, err := toml.Marshal(c)
 	if err != nil {

@@ -105,7 +105,7 @@ func connectionsAdd(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("connections add", stderr)
 	var (
 		cfgPath      = fs.String("config", "", "config file path")
-		dsn          = fs.String("dsn", "", "full DSN (postgres://... or mysql://...); the password is stripped and stored via the chosen secret backend")
+		dsn          = fs.String("dsn", "", "DSN template (postgres://user@host/db); omit the password — you'll be prompted, or pipe it on stdin (a password on the command line is world-readable via ps)")
 		pwEnv        = fs.String("password-env", "", "store the password as an env reference (env var name); its value is NOT stored")
 		pwKeyring    = fs.String("password-keyring", "", "store the password in the OS keychain under this name (value taken from the DSN or stdin)")
 		defaultDB    = fs.String("default-database", "", "database to back up when --database is omitted")
@@ -130,6 +130,12 @@ func connectionsAdd(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
+	}
+	if password != "" {
+		// The password was on argv (world-readable via `ps`, shell history,
+		// /proc/<pid>/cmdline). We still strip and store it, but warn so the
+		// user learns to omit it and use the prompt / stdin next time.
+		fmt.Fprintln(stderr, "dbferry: warning: a password on the command line is world-readable (ps, shell history); prefer omitting it from --dsn and entering it at the prompt or via stdin")
 	}
 
 	conn := &config.Connection{
@@ -175,12 +181,21 @@ func connectionsAdd(args []string, stdout, stderr io.Writer) int {
 func connectionsRm(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("connections rm", stderr)
 	cfgPath := fs.String("config", "", "config file path")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt (required for non-interactive use)")
 	name, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry connections rm <name>")
+		fmt.Fprintln(stderr, "usage: dbferry connections rm <name> [--yes]")
 		return 1
 	}
 	path := configPath(*cfgPath)
+	// Hold the lock across load → mutate → write so a concurrent add/rm can't
+	// lose an update.
+	unlock, err := config.Lock(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "dbferry: "+err.Error())
+		return 1
+	}
+	defer unlock()
 	cfg, err := config.Load(path)
 	if err != nil {
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
@@ -191,16 +206,32 @@ func connectionsRm(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dbferry: no connection named %q\n", name)
 		return 1
 	}
+	if !*yes {
+		ok, interactive := confirmTTY(fmt.Sprintf("Remove connection %q and its stored password?", name))
+		if !interactive {
+			fmt.Fprintln(stderr, "dbferry: refusing to remove without confirmation; pass --yes")
+			return 1
+		}
+		if !ok {
+			fmt.Fprintln(stderr, "aborted")
+			return 1
+		}
+	}
 	delete(cfg.Connections, name)
+	// Persist the removal BEFORE deleting the keychain secret: if the write
+	// fails (disk), the secret must survive so the still-listed connection
+	// stays usable. Deleting first and then failing the write would leave a
+	// config entry whose password is gone for good. A failed Delete after a
+	// good write only orphans a keychain entry — the safe direction.
+	if err := cfg.SaveLocked(path); err != nil {
+		fmt.Fprintln(stderr, "dbferry: "+err.Error())
+		return 1
+	}
 	// Delete the keychain secret only if no other record references it.
 	if c.Password.Keyring != "" && !secretRefStillUsed(cfg, c.Password) {
 		if err := c.Password.Delete(); err != nil {
 			fmt.Fprintf(stderr, "dbferry: warning: %v\n", err)
 		}
-	}
-	if err := cfg.Save(path); err != nil {
-		fmt.Fprintln(stderr, "dbferry: "+err.Error())
-		return 1
 	}
 	fmt.Fprintf(stdout, "removed connection %q\n", name)
 	return 0
@@ -314,13 +345,19 @@ func destinationsAdd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	path := configPath(*cfgPath)
+	unlock, err := config.Lock(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "dbferry: "+err.Error())
+		return 1
+	}
+	defer unlock()
 	cfg, err := config.Load(path)
 	if err != nil {
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
 	}
 	cfg.Destinations[name] = dst
-	if err := cfg.Save(path); err != nil {
+	if err := cfg.SaveLocked(path); err != nil {
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
 	}
@@ -331,12 +368,19 @@ func destinationsAdd(args []string, stdout, stderr io.Writer) int {
 func destinationsRm(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("destinations rm", stderr)
 	cfgPath := fs.String("config", "", "config file path")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt (required for non-interactive use)")
 	name, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry destinations rm <name>")
+		fmt.Fprintln(stderr, "usage: dbferry destinations rm <name> [--yes]")
 		return 1
 	}
 	path := configPath(*cfgPath)
+	unlock, err := config.Lock(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "dbferry: "+err.Error())
+		return 1
+	}
+	defer unlock()
 	cfg, err := config.Load(path)
 	if err != nil {
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
@@ -347,7 +391,24 @@ func destinationsRm(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dbferry: no destination named %q\n", name)
 		return 1
 	}
+	if !*yes {
+		ok, interactive := confirmTTY(fmt.Sprintf("Remove destination %q and its stored credentials?", name))
+		if !interactive {
+			fmt.Fprintln(stderr, "dbferry: refusing to remove without confirmation; pass --yes")
+			return 1
+		}
+		if !ok {
+			fmt.Fprintln(stderr, "aborted")
+			return 1
+		}
+	}
 	delete(cfg.Destinations, name)
+	// Persist the removal BEFORE deleting keychain secrets (see connectionsRm):
+	// a failed write must not leave a still-listed destination with lost keys.
+	if err := cfg.SaveLocked(path); err != nil {
+		fmt.Fprintln(stderr, "dbferry: "+err.Error())
+		return 1
+	}
 	// Delete keychain-backed dest secrets only if not shared.
 	for _, r := range []*config.SecretRef{d.AccessKey, d.SecretKey, d.SessionToken} {
 		if r != nil && r.Keyring != "" && !secretRefStillUsed(cfg, *r) {
@@ -355,10 +416,6 @@ func destinationsRm(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "dbferry: warning: %v\n", err)
 			}
 		}
-	}
-	if err := cfg.Save(path); err != nil {
-		fmt.Fprintln(stderr, "dbferry: "+err.Error())
-		return 1
 	}
 	fmt.Fprintf(stdout, "removed destination %q\n", name)
 	return 0
@@ -396,12 +453,17 @@ func splitDSN(dsn string) (engine, template, password string, err error) {
 }
 
 func upsertConnection(path, name string, conn *config.Connection) error {
+	unlock, err := config.Lock(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	cfg, err := config.Load(path)
 	if err != nil {
 		return err
 	}
 	cfg.Connections[name] = conn
-	return cfg.Save(path)
+	return cfg.SaveLocked(path)
 }
 
 func secretRefStillUsed(cfg *config.Config, ref config.SecretRef) bool {

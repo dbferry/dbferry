@@ -36,3 +36,17 @@ func promptLine(label string) string {
 	line, _ := stdinReader.ReadString('\n')
 	return strings.TrimSpace(line)
 }
+
+// confirmTTY asks a yes/no question on an interactive terminal. The second
+// return value is false when stdin is not a terminal — callers then require an
+// explicit --yes rather than assuming consent, so scripts never delete by
+// accident.
+func confirmTTY(label string) (yes, interactive bool) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return false, false
+	}
+	fmt.Fprint(os.Stderr, label+" [y/N]: ")
+	line, _ := stdinReader.ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	return line == "y" || line == "yes", true
+}

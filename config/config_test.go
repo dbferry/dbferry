@@ -88,8 +88,10 @@ func TestBackupDSNSelectsDatabaseAndInjectsPassword(t *testing.T) {
 	if strings.Contains(dsn, "p@ss:w/rd") {
 		t.Errorf("password should be percent-encoded, not raw: %s", dsn)
 	}
-	if len(secrets) != 1 || secrets[0] != "p@ss:w/rd" {
-		t.Errorf("secrets = %v", secrets)
+	// Both the raw password and its URL-encoded form (as it appears in the
+	// built DSN) are registered for redaction.
+	if len(secrets) != 2 || secrets[0] != "p@ss:w/rd" || secrets[1] != "p%40ss%3Aw%2Frd" {
+		t.Errorf("secrets = %v, want [raw, url-encoded]", secrets)
 	}
 	// No database anywhere → error.
 	if _, _, err := conn.BackupDSN(""); err == nil {

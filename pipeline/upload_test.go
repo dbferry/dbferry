@@ -238,3 +238,36 @@ func TestIsNoSuchUpload(t *testing.T) {
 }
 
 func sha256Sum(b []byte) []byte { s := sha256.Sum256(b); return s[:] }
+
+// TestS3ClientChecksumDisabledEverywhere pins the P1 fix: the SDK's
+// default-integrity per-part checksums must be off for BOTH a real-AWS target
+// (no endpoint) and an S3-compatible endpoint. Left on for AWS, the SDK adds a
+// CRC32 to each UploadPart and AWS rejects our manual CompleteMultipartUpload
+// (which carries no per-part checksums). Regressing this silently breaks every
+// backup to a customer's own AWS bucket while MinIO CI stays green.
+func TestS3ClientChecksumDisabledEverywhere(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+	}{
+		{"real AWS (no endpoint)", ""},
+		{"S3-compatible endpoint", "http://minio.local:9000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := newS3Client(context.Background(), Config{
+				S3Region: "us-east-1", S3Endpoint: tc.endpoint,
+				S3Credentials: &S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			o := client.Options()
+			if o.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired {
+				t.Errorf("RequestChecksumCalculation = %v, want WhenRequired (SDK default breaks AWS multipart Complete)", o.RequestChecksumCalculation)
+			}
+			if o.ResponseChecksumValidation != aws.ResponseChecksumValidationWhenRequired {
+				t.Errorf("ResponseChecksumValidation = %v, want WhenRequired", o.ResponseChecksumValidation)
+			}
+		})
+	}
+}
