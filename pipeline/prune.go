@@ -2,8 +2,10 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -57,7 +59,7 @@ func Prune(ctx context.Context, cfg Config, policy RetentionPolicy, opts PruneOp
 	if err := policy.Validate(); err != nil {
 		return PruneResult{}, err
 	}
-	scope, dst, err := backupScope(cfg)
+	scope, dst, owner, err := backupScope(cfg)
 	if err != nil {
 		return PruneResult{}, err
 	}
@@ -68,25 +70,34 @@ func Prune(ctx context.Context, cfg Config, policy RetentionPolicy, opts PruneOp
 	if err != nil {
 		return PruneResult{}, err
 	}
-	return pruneWith(ctx, api, dst.bucket, scope, policy, opts)
+	return pruneWith(ctx, api, dst.bucket, scope, owner, policy, opts)
 }
 
 // pruneWith is the client-agnostic core of Prune, injectable for tests.
-func pruneWith(ctx context.Context, api s3ObjectAPI, bucket, scope string, policy RetentionPolicy, opts PruneOptions) (PruneResult, error) {
-	listing, err := listBackups(ctx, api, bucket, scope)
+func pruneWith(ctx context.Context, api s3ObjectAPI, bucket, scope string, owner *scopeOwner, policy RetentionPolicy, opts PruneOptions) (PruneResult, error) {
+	listing, err := listBackups(ctx, api, bucket, scope, owner)
 	if err != nil {
 		return PruneResult{}, err
 	}
 
 	res := PruneResult{Listing: listing}
-	var dangling []string
+	var danglingKeys []string
 	for _, b := range listing.Backups {
 		switch b.State {
 		case BackupOrphan:
 			res.Orphans = append(res.Orphans, b)
 		case BackupDanglingManifest:
-			dangling = append(dangling, b.ManifestKey)
+			danglingKeys = append(danglingKeys, b.ManifestKey)
 		}
+	}
+	// Dangling classification is by key suffix alone — before deleting, read
+	// each manifest and keep hands off anything that isn't verifiably one of
+	// ours at the current key_schema. A newer schema's manifest (whose
+	// ciphertext key this build simply doesn't recognize) must survive an old
+	// binary's prune pass.
+	dangling, err := deletableDangling(ctx, api, bucket, owner, danglingKeys)
+	if err != nil {
+		return res, err
 	}
 	res.Kept, res.Deleted = SelectRetention(listing.Backups, policy)
 
@@ -104,18 +115,61 @@ func pruneWith(ctx context.Context, api s3ObjectAPI, bucket, scope string, polic
 	return res, nil
 }
 
+// deletableDangling filters dangling-manifest keys down to the ones this build
+// may delete: manifests that fetch, parse, carry exactly the current
+// key_schema AND claim this scope's own identity — the same owner line of
+// defense readManifest applies to paired manifests. Anything unreadable, from
+// another schema, or claiming another database is left in place (reported as
+// dangling again on the next pass); a transport error fails the pass so the
+// caller retries.
+func deletableDangling(ctx context.Context, api s3ObjectAPI, bucket string, owner *scopeOwner, keys []string) ([]string, error) {
+	var out []string
+	for _, key := range keys {
+		obj, err := api.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		if err != nil {
+			return nil, classify(KindUpload, "pipeline: read dangling manifest s3://%s/%s: %w", bucket, key, err)
+		}
+		// Read one byte past the cap: an oversized object is not one of our
+		// manifests (they are well under a kilobyte), and a truncated read
+		// that still parses must not make it deletable.
+		body, err := io.ReadAll(io.LimitReader(obj.Body, maxManifestBytes+1))
+		closeErr := obj.Body.Close()
+		if err != nil || closeErr != nil {
+			return nil, classify(KindUpload, "pipeline: read dangling manifest s3://%s/%s: %w", bucket, key, firstErr(err, closeErr))
+		}
+		if len(body) > maxManifestBytes {
+			continue
+		}
+		var m Manifest
+		if json.Unmarshal(body, &m) != nil || m.KeySchema != keySchemaVersion || !owner.matches(&m) {
+			continue
+		}
+		out = append(out, key)
+	}
+	return out, nil
+}
+
 // DeleteBackups deletes the given backups (ciphertexts first, then manifests)
-// under cfg.Dest. Every key must lie inside the scope derived from cfg and
-// carry the expected artifact suffix — anything else fails before a single
-// deletion starts.
+// under cfg.Dest. Every entry must be a BackupValid listing result whose
+// manifest claims this configuration's own engine/cluster/database, lie
+// inside the scope derived from cfg, and carry the expected artifact suffix —
+// anything else fails before a single deletion starts. Callers therefore
+// cannot smuggle orphans, dangling manifests, or another database's backups
+// through this API, whatever list they assembled.
 func DeleteBackups(ctx context.Context, cfg Config, backups []BackupInfo) error {
 	api, err := newS3Client(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	scope, dst, err := backupScope(cfg)
+	scope, dst, owner, err := backupScope(cfg)
 	if err != nil {
 		return err
+	}
+	for _, b := range backups {
+		if b.State != BackupValid || b.Manifest == nil || !owner.matches(b.Manifest) {
+			return classify(KindUpload,
+				"pipeline: refusing to delete %q: not a validated backup of this database (state %s)", b.Key, b.State)
+		}
 	}
 	return deleteBackups(ctx, api, dst.bucket, scope, backups)
 }

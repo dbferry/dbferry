@@ -83,7 +83,53 @@ func TestNewBackupIDFormatAndUniqueness(t *testing.T) {
 }
 
 func TestSanitizeKeySegment(t *testing.T) {
-	if got := sanitizeKeySegment("a/b c\td"); got != "a_b_c_d" {
-		t.Errorf("sanitizeKeySegment = %q, want %q", got, "a_b_c_d")
+	cases := []struct{ in, want string }{
+		{"a/b c\td", "a%2Fb%20c%09d"},
+		{"shop", "shop"},
+		{"my_db", "my_db"},
+		// "." and ".." must not survive: path.Join would collapse them and
+		// widen the per-database scope onto other databases' backups.
+		{".", "%2E"},
+		{"..", "%2E%2E"},
+		{"", "%"},
+		// Control characters (legal in quoted identifiers) must not reach the
+		// key: \r enables log spoofing, DEL and friends break tooling.
+		{"a\rb", "a%0Db"},
+		{"a\x7fb", "a%7Fb"},
+		// '%' is escaped so the encoding stays reversible → collision-free.
+		{"100%", "100%25"},
+		{"%2E", "%252E"},
+	}
+	for _, c := range cases {
+		if got := sanitizeKeySegment(c.in); got != c.want {
+			t.Errorf("sanitizeKeySegment(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	// Collision-freedom is the retention-safety invariant: distinct names must
+	// never map to one scope (pruning one database must not see the other's
+	// backups). These pairs collided under naive replacement-char mappings.
+	pairs := [][2]string{
+		{"..", "__"}, {".", "_"}, {"", "_"},
+		{"my db", "my_db"}, {"a\rb", "a_b"}, {"%2E", ".."},
+	}
+	for _, p := range pairs {
+		if sanitizeKeySegment(p[0]) == sanitizeKeySegment(p[1]) {
+			t.Errorf("sanitizeKeySegment collision: %q and %q both map to %q", p[0], p[1], sanitizeKeySegment(p[0]))
+		}
+	}
+}
+
+func TestScopeCannotEscapeViaDotSegments(t *testing.T) {
+	// A database literally named ".." (legal in PostgreSQL, reachable straight
+	// from the DSN path) must scope to its own directory, not collapse the
+	// prefix and pool every database's backups into one retention pass.
+	scope, _, _, err := backupScope(Config{DSN: "postgres://u:p@host:5432/..", Dest: "s3://bucket/pfx"})
+	if err != nil {
+		t.Fatalf("backupScope: %v", err)
+	}
+	want := "pfx/postgres/host/%2E%2E/"
+	if scope != want {
+		t.Fatalf("scope = %q, want %q", scope, want)
 	}
 }

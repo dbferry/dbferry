@@ -120,11 +120,24 @@ func ListBackups(ctx context.Context, cfg Config) (Listing, error) {
 	if err != nil {
 		return Listing{}, err
 	}
-	scope, dst, err := backupScope(cfg)
+	scope, dst, owner, err := backupScope(cfg)
 	if err != nil {
 		return Listing{}, err
 	}
-	return listBackups(ctx, api, dst.bucket, scope)
+	return listBackups(ctx, api, dst.bucket, scope, owner)
+}
+
+// scopeOwner is the identity a scope's manifests must claim. A manifest under
+// the right key prefix whose engine/cluster/database say otherwise is treated
+// as foreign — reported, never deleted. This is defense in depth against any
+// key-encoding drift ever pooling two databases into one retention pass: keys
+// can collide only if the manifests, written from the raw names, agree too.
+type scopeOwner struct {
+	engine, cluster, database string
+}
+
+func (o *scopeOwner) matches(m *Manifest) bool {
+	return o == nil || (m.Engine == o.engine && m.Cluster == o.cluster && m.Database == o.database)
 }
 
 // BackupScope returns the per-database scope prefix a backup object key
@@ -136,25 +149,27 @@ func BackupScope(objectKey string) string {
 }
 
 // backupScope derives the per-database key prefix from the run configuration,
-// sharing the exact derivation Run uses for the object key.
-func backupScope(cfg Config) (string, dest, error) {
+// sharing the exact derivation Run uses for the object key, plus the identity
+// that scope's manifests must claim.
+func backupScope(cfg Config) (string, dest, *scopeOwner, error) {
 	drv, err := newDriver(cfg.DSN)
 	if err != nil {
-		return "", dest{}, err
+		return "", dest{}, nil, err
 	}
 	dst, err := parseDest(cfg.Dest)
 	if err != nil {
-		return "", dest{}, err
+		return "", dest{}, nil, err
 	}
 	segs := make([]string, 0, 4)
 	if dst.prefix != "" {
 		segs = append(segs, dst.prefix)
 	}
 	segs = append(segs, drv.Engine(), drv.Cluster(), sanitizeKeySegment(drv.Database()))
-	return path.Join(segs...) + "/", dst, nil
+	owner := &scopeOwner{engine: drv.Engine(), cluster: drv.Cluster(), database: drv.Database()}
+	return path.Join(segs...) + "/", dst, owner, nil
 }
 
-func listBackups(ctx context.Context, api s3ObjectAPI, bucket, scope string) (Listing, error) {
+func listBackups(ctx context.Context, api s3ObjectAPI, bucket, scope string, owner *scopeOwner) (Listing, error) {
 	// stem (key without artifact suffix) → the pair of artifacts seen there.
 	type artifacts struct {
 		cipherKey   string
@@ -219,7 +234,7 @@ func listBackups(ctx context.Context, api s3ObjectAPI, bucket, scope string) (Li
 				Bytes:     p.cipherBytes,
 			})
 		default:
-			info, err := readManifest(ctx, api, bucket, p.cipherKey, p.manifestKey, p.manifestLen)
+			info, err := readManifest(ctx, api, bucket, p.cipherKey, p.manifestKey, p.manifestLen, owner)
 			if err != nil {
 				return Listing{}, err
 			}
@@ -242,7 +257,7 @@ func listBackups(ctx context.Context, api s3ObjectAPI, bucket, scope string) (Li
 // read as ours degrades the backup's state (corrupt/unsupported) rather than
 // failing the listing; a transport error fails the listing so the caller can
 // retry.
-func readManifest(ctx context.Context, api s3ObjectAPI, bucket, cipherKey, manifestKey string, size int64) (BackupInfo, error) {
+func readManifest(ctx context.Context, api s3ObjectAPI, bucket, cipherKey, manifestKey string, size int64, owner *scopeOwner) (BackupInfo, error) {
 	info := BackupInfo{Key: cipherKey, ManifestKey: manifestKey, CreatedAt: createdAtFromStem(strings.TrimSuffix(cipherKey, ciphertextSuffix))}
 	if size > maxManifestBytes {
 		info.State = BackupCorruptManifest
@@ -267,11 +282,13 @@ func readManifest(ctx context.Context, api s3ObjectAPI, bucket, cipherKey, manif
 		return info, nil
 	}
 	// Only an exact, fully-populated schema-1 manifest that describes its
-	// sibling is trusted; anything less is corrupt and never touched. JSON
-	// zero values must not slip through as "valid" — a manifest is the thing
-	// that makes a ciphertext deletable.
+	// sibling AND claims this scope's own engine/cluster/database is trusted;
+	// anything less is corrupt and never touched. JSON zero values must not
+	// slip through as "valid" — a manifest is the thing that makes a
+	// ciphertext deletable, and the identity check makes key-encoding
+	// collisions insufficient to pool two databases into one retention pass.
 	created, timeErr := time.Parse(time.RFC3339, m.CreatedAt)
-	if m.KeySchema != keySchemaVersion || m.Object != cipherKey || m.BackupID == "" || timeErr != nil {
+	if m.KeySchema != keySchemaVersion || m.Object != cipherKey || m.BackupID == "" || timeErr != nil || !owner.matches(&m) {
 		info.State = BackupCorruptManifest
 		return info, nil
 	}

@@ -15,7 +15,7 @@ import (
 // against the fake store, mirroring Prune without a real S3 client.
 func prune(t *testing.T, f *fakeObjectStore, policy RetentionPolicy, dryRun bool) PruneResult {
 	t.Helper()
-	res, err := pruneWith(context.Background(), f, "bucket", testScope, policy, PruneOptions{DryRun: dryRun})
+	res, err := pruneWith(context.Background(), f, "bucket", testScope, nil, policy, PruneOptions{DryRun: dryRun})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
@@ -61,6 +61,79 @@ func TestPruneDeletesPolicyDropsAndDangling(t *testing.T) {
 	}
 }
 
+func TestPruneLeavesForeignDanglingManifests(t *testing.T) {
+	f := newFakeObjectStore()
+	f.putBackup(testScope, mustTime(t, "2026-07-15T02:00:00Z"), "a")
+	newer := testScope + "2026/07/20260710T020000Z-NEWER" + manifestSuffix
+	f.objects[newer] = []byte(`{"key_schema":2}`)
+	junk := testScope + "2026/07/20260709T020000Z-JUNK" + manifestSuffix
+	f.objects[junk] = []byte(`not json`)
+	ours := testScope + "2026/07/20260708T020000Z-OURS" + manifestSuffix
+	f.objects[ours] = []byte(`{"key_schema":1}`)
+
+	res := prune(t, f, RetentionPolicy{KeepDaily: 1}, false)
+
+	if len(res.DanglingDeleted) != 1 || res.DanglingDeleted[0] != ours {
+		t.Fatalf("dangling deleted %v, want only %s", res.DanglingDeleted, ours)
+	}
+	for _, kept := range []string{newer, junk} {
+		if _, ok := f.objects[kept]; !ok {
+			t.Errorf("%s was deleted; a manifest that isn't verifiably schema-%d must survive", kept, keySchemaVersion)
+		}
+	}
+}
+
+// TestPruneDanglingOwnerCheck: a dangling manifest claiming another database's
+// identity must survive the pass even in a collided scope — same owner line of
+// defense as paired manifests.
+func TestPruneDanglingOwnerCheck(t *testing.T) {
+	f := newFakeObjectStore()
+	f.putBackup(testScope, mustTime(t, "2026-07-15T02:00:00Z"), "a")
+	foreign := testScope + "2026/07/20260710T020000Z-FOREIGN" + manifestSuffix
+	f.objects[foreign] = []byte(`{"key_schema":1,"engine":"postgres","cluster":"host","database":"other"}`)
+	ours := testScope + "2026/07/20260709T020000Z-OURS" + manifestSuffix
+	f.objects[ours] = []byte(`{"key_schema":1,"engine":"postgres","cluster":"host","database":"db"}`)
+
+	owner := &scopeOwner{engine: "postgres", cluster: "host", database: "db"}
+	res, err := pruneWith(context.Background(), f, "bucket", testScope, owner, RetentionPolicy{KeepDaily: 1}, PruneOptions{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(res.DanglingDeleted) != 1 || res.DanglingDeleted[0] != ours {
+		t.Fatalf("dangling deleted %v, want only %s", res.DanglingDeleted, ours)
+	}
+	if _, ok := f.objects[foreign]; !ok {
+		t.Error("a dangling manifest claiming another database was deleted")
+	}
+}
+
+// TestDeleteBackupsRefusesUnvalidatedEntries: the exported API must not let a
+// caller-assembled list smuggle orphans or foreign-identity backups through —
+// only BackupValid entries whose manifest claims this config's own database
+// are deletable.
+func TestDeleteBackupsRefusesUnvalidatedEntries(t *testing.T) {
+	cfg := Config{DSN: "postgres://u@host:5432/db", Dest: "s3://bucket/pfx"}
+	orphan := []BackupInfo{{
+		Key:   "pfx/postgres/host/db/2026/07/x" + ciphertextSuffix,
+		State: BackupOrphan,
+	}}
+	if err := DeleteBackups(context.Background(), cfg, orphan); err == nil ||
+		!strings.Contains(err.Error(), "refusing to delete") {
+		t.Fatalf("orphan must be refused: %v", err)
+	}
+
+	foreign := []BackupInfo{{
+		Key:         "pfx/postgres/host/db/2026/07/y" + ciphertextSuffix,
+		ManifestKey: "pfx/postgres/host/db/2026/07/y" + manifestSuffix,
+		State:       BackupValid,
+		Manifest:    &Manifest{KeySchema: keySchemaVersion, Engine: "postgres", Cluster: "host", Database: "other"},
+	}}
+	if err := DeleteBackups(context.Background(), cfg, foreign); err == nil ||
+		!strings.Contains(err.Error(), "refusing to delete") {
+		t.Fatalf("foreign-identity manifest must be refused: %v", err)
+	}
+}
+
 func TestPruneDeletesCiphertextBeforeManifest(t *testing.T) {
 	f := newFakeObjectStore()
 	f.putBackup(testScope, mustTime(t, "2026-07-15T02:00:00Z"), "keepme")
@@ -86,7 +159,7 @@ func TestPruneDryRunDeletesNothing(t *testing.T) {
 	f := newFakeObjectStore()
 	f.putBackup(testScope, mustTime(t, "2026-07-15T02:00:00Z"), "a")
 	f.putBackup(testScope, mustTime(t, "2026-07-01T02:00:00Z"), "b")
-	f.objects[testScope+"2026/07/20260710T020000Z-GONE"+manifestSuffix] = []byte(`{}`)
+	f.objects[testScope+"2026/07/20260710T020000Z-GONE"+manifestSuffix] = []byte(`{"key_schema":1}`)
 	before := len(f.objects)
 
 	res := prune(t, f, RetentionPolicy{KeepDaily: 1}, true)
@@ -130,7 +203,7 @@ func TestPrunePartialDeleteErrorPropagates(t *testing.T) {
 		Message: aws.String("no delete for you"),
 	}}
 
-	_, err := pruneWith(context.Background(), f, "bucket", testScope, RetentionPolicy{KeepDaily: 1}, PruneOptions{})
+	_, err := pruneWith(context.Background(), f, "bucket", testScope, nil, RetentionPolicy{KeepDaily: 1}, PruneOptions{})
 	if err == nil || !strings.Contains(err.Error(), "s3:DeleteObject") {
 		t.Fatalf("partial delete failure must surface the missing permission, got: %v", err)
 	}

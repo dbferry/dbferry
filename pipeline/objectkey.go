@@ -65,15 +65,34 @@ func newBackupID(t time.Time) (string, error) {
 	return t.Format("20060102T150405Z") + "-" + id.String(), nil
 }
 
-// sanitizeKeySegment keeps a DSN-derived value safe and tidy inside an object
-// key: path separators and whitespace become underscores.
+// sanitizeKeySegment keeps a DSN-derived value safe inside an object key.
+// Two invariants, both load-bearing for retention safety:
+//
+//   - "" / "." / ".." must never survive as a segment — path.Join would
+//     collapse them and widen the per-database scope onto sibling databases'
+//     backups (a database named ".." would otherwise scope the retention pass
+//     to the whole engine root and let Prune delete other databases' backups).
+//   - The mapping must be collision-free: two distinct database names on one
+//     cluster must never share a scope, or pruning one could delete the
+//     other's backups. Percent-encoding ('%' included, so decoding is
+//     unambiguous) guarantees that; a lossy replacement-char mapping cannot.
 func sanitizeKeySegment(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case '/', '\\', ' ', '\t', '\n':
-			return '_'
+	switch s {
+	case ".", "..":
+		return strings.ReplaceAll(s, ".", "%2E")
+	case "":
+		// No input ever encodes to a bare "%" ('%' itself becomes "%25"),
+		// so this cannot collide with any real name.
+		return "%"
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '/' || c == '\\' || c == ' ' || c == '%' || c < 0x20 || c == 0x7f:
+			fmt.Fprintf(&b, "%%%02X", c)
 		default:
-			return r
+			b.WriteByte(c)
 		}
-	}, s)
+	}
+	return b.String()
 }

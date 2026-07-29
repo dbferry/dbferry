@@ -102,7 +102,7 @@ const testScope = "pfx/postgres/host/db/"
 
 func mustList(t *testing.T, f *fakeObjectStore) Listing {
 	t.Helper()
-	l, err := listBackups(context.Background(), f, "bucket", testScope)
+	l, err := listBackups(context.Background(), f, "bucket", testScope, nil)
 	if err != nil {
 		t.Fatalf("listBackups: %v", err)
 	}
@@ -180,6 +180,41 @@ func TestListBackupsPairsAndStates(t *testing.T) {
 	}
 }
 
+// TestListBackupsOwnerCheck pins the identity line of defense: even if two
+// databases' keys ever collided into one scope (an encoding bug, a hand-copied
+// object), a manifest claiming a different engine/cluster/database is corrupt
+// — reported, never deletable — so retention cannot pool foreign backups.
+func TestListBackupsOwnerCheck(t *testing.T) {
+	f := newFakeObjectStore()
+	oursKey := f.putBackup(testScope, mustTime(t, "2026-07-15T02:00:00Z"), "c1")
+	m := Manifest{KeySchema: keySchemaVersion, BackupID: "x", CreatedAt: "2026-07-15T02:00:00Z",
+		Engine: "postgres", Cluster: "host", Database: "db", Object: oursKey}
+	b, _ := m.marshal()
+	f.objects[manifestKey(oursKey)] = b
+
+	foreignKey := f.putBackup(testScope, mustTime(t, "2026-07-14T02:00:00Z"), "c2")
+	m.Database = "other"
+	m.Object = foreignKey
+	b, _ = m.marshal()
+	f.objects[manifestKey(foreignKey)] = b
+
+	owner := &scopeOwner{engine: "postgres", cluster: "host", database: "db"}
+	l, err := listBackups(context.Background(), f, "bucket", testScope, owner)
+	if err != nil {
+		t.Fatalf("listBackups: %v", err)
+	}
+	states := map[string]BackupState{}
+	for _, bi := range l.Backups {
+		states[bi.Key] = bi.State
+	}
+	if states[oursKey] != BackupValid {
+		t.Errorf("own backup state = %v, want valid", states[oursKey])
+	}
+	if states[foreignKey] != BackupCorruptManifest {
+		t.Errorf("foreign-identity backup state = %v, want corrupt (never deletable)", states[foreignKey])
+	}
+}
+
 func TestListBackupsNewestFirst(t *testing.T) {
 	f := newFakeObjectStore()
 	f.putBackup(testScope, mustTime(t, "2026-07-13T02:00:00Z"), "a")
@@ -223,7 +258,7 @@ func TestListBackupsGetErrorFailsListing(t *testing.T) {
 	f.putBackup(testScope, mustTime(t, "2026-07-15T02:00:00Z"), "cipher")
 	f.onGet = fmt.Errorf("connection reset")
 
-	if _, err := listBackups(context.Background(), f, "bucket", testScope); err == nil {
+	if _, err := listBackups(context.Background(), f, "bucket", testScope, nil); err == nil {
 		t.Fatal("transport error during manifest read must fail the listing (retryable), got nil")
 	}
 }

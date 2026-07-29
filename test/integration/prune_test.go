@@ -61,8 +61,8 @@ func TestPruneRetention(t *testing.T) {
 	// months — month boundaries can't shift under the test whatever today is.
 	now := time.Now().UTC()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	prevMonth := putFakeBackup(t, client, scope, monthStart.AddDate(0, -1, 14).Add(12*time.Hour))
-	prevPrevMonth := putFakeBackup(t, client, scope, monthStart.AddDate(0, -2, 14).Add(12*time.Hour))
+	prevMonth := putFakeBackup(t, client, scope, srcDB, monthStart.AddDate(0, -1, 14).Add(12*time.Hour))
+	prevPrevMonth := putFakeBackup(t, client, scope, srcDB, monthStart.AddDate(0, -2, 14).Add(12*time.Hour))
 	// An orphan: ciphertext without manifest.
 	orphanKey := scope + now.Format("2006/01") + "/" + now.Format("20060102T150405Z") + "-ORPHAN00000000000000000000.dump.zst.age"
 	putRaw(t, client, orphanKey, []byte("interrupted upload"))
@@ -116,9 +116,20 @@ func TestPruneRetention(t *testing.T) {
 }
 
 // putFakeBackup writes a hand-crafted, back-dated ciphertext+manifest pair
-// that is indistinguishable from a real backup for listing purposes.
-func putFakeBackup(t *testing.T, client *s3.Client, scope string, created time.Time) string {
+// that is indistinguishable from a real backup for listing purposes. The
+// manifest must claim the scope's true cluster/database identity — listing
+// treats a manifest claiming another identity as corrupt (and rightly never
+// deletes it), which would leak fakes past the retention pass. The database
+// is passed RAW (manifests store the raw name; the scope segment is the
+// encoded form, so it cannot be recovered from the key). The cluster label is
+// safe to lift from the scope: manifests store the already-sanitized label.
+func putFakeBackup(t *testing.T, client *s3.Client, scope, database string, created time.Time) string {
 	t.Helper()
+	segs := strings.Split(strings.TrimSuffix(scope, "/"), "/")
+	if len(segs) < 3 {
+		t.Fatalf("scope %q too short to carry engine/cluster/database", scope)
+	}
+	cluster := segs[len(segs)-2]
 	id := created.UTC().Format("20060102T150405Z") + "-01BACKDATED" + created.UTC().Format("150405") + "000000000"
 	key := scope + created.UTC().Format("2006/01") + "/" + id + ".dump.zst.age"
 	putRaw(t, client, key, []byte("back-dated fake ciphertext"))
@@ -128,8 +139,8 @@ func putFakeBackup(t *testing.T, client *s3.Client, scope string, created time.T
 		"backup_id":         id,
 		"created_at":        created.UTC().Format(time.RFC3339),
 		"engine":            "postgres",
-		"cluster":           "integration",
-		"database":          "it",
+		"cluster":           cluster,
+		"database":          database,
 		"object":            key,
 		"format":            "pg_dump -Fc -Z0 | zstd | age",
 		"dump_client":       "fake",

@@ -37,6 +37,18 @@ same database. The date in the path exists for bucket lifecycle rules and
 human navigation. Any change to this layout requires a new `key_schema`
 version — never a silent change.
 
+The `<cluster>` and `<database>` segments are percent-encoded (part of the
+schema-1 definition, fixed 2026-07-29 — before any public release, so no
+schema bump): `/`, `\`, space, `%`, control characters and DEL become `%XX`;
+a database named `.` or `..` becomes `%2E`/`%2E%2E` (a raw dot segment would
+collapse under path joining and widen the per-database scope); an empty value
+becomes `%`. Because `%` itself is escaped, the mapping is reversible —
+two distinct database names can never share a scope, which is what makes
+per-scope retention deletes safe. As defense in depth, listing additionally
+requires a manifest's `engine`/`cluster`/`database` to match the scope being
+listed; a manifest claiming another identity is reported as corrupt and never
+deleted.
+
 **Validity invariant: a backup is valid only with its manifest.** The manifest
 is written only after `CompleteMultipartUpload` succeeds. A ciphertext object
 without a manifest is an incomplete upload: subject to reconciliation/cleanup,
