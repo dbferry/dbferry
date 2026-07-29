@@ -50,8 +50,8 @@ func Load(path string) (*Config, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("config %s is not a regular file", path)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, fmt.Errorf("config %s has insecure permissions %#o; want 0600 (chmod 600 %s)", path, perm, path)
+	if err := RequirePrivate("config", path, info); err != nil {
+		return nil, err
 	}
 	if err := checkOwner(path, info); err != nil {
 		return nil, err
@@ -70,6 +70,14 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Destinations == nil {
 		c.Destinations = map[string]*Destination{}
+	}
+	// A hand-edited entry that lost its password reference must fail HERE,
+	// naming the entry — otherwise it surfaces later as an opaque marshal
+	// error that blocks every config write.
+	for name, conn := range c.Connections {
+		if conn.Password.empty() {
+			return nil, fmt.Errorf("config %s: connection %q has no password reference; add password = \"keyring:NAME\" or \"env:VAR\"", path, name)
+		}
 	}
 	return c, nil
 }

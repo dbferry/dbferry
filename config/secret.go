@@ -100,6 +100,34 @@ func (r SecretRef) Store(value string) error {
 	return nil
 }
 
+// StoreWithRollback stores a value like Store and returns a rollback that
+// puts the keychain back the way it was: restore the previous value if the
+// entry existed, delete the entry if it did not. A plain Delete-on-failure
+// would be wrong here — re-running add/init over an existing connection and
+// hitting a config-write error must not destroy the only copy of that
+// connection's stored password. If the prior state cannot be determined, the
+// store is refused up front: overwriting a value we could not read risks
+// destroying it with no way back. The rollback returns an error so callers
+// can tell the user when the keychain was left holding the new value.
+func (r SecretRef) StoreWithRollback(value string) (func() error, error) {
+	prev, getErr := keyring.Get(keyringService, r.Keyring)
+	if getErr != nil && !errors.Is(getErr, keyring.ErrNotFound) {
+		return nil, fmt.Errorf("read current secret %q from the OS keychain: %w (not overwriting a value that cannot be restored)", r.Keyring, getErr)
+	}
+	if err := r.Store(value); err != nil {
+		return nil, err
+	}
+	if getErr == nil {
+		return func() error {
+			if err := keyring.Set(keyringService, r.Keyring, prev); err != nil {
+				return fmt.Errorf("restore previous secret %q in the OS keychain: %w", r.Keyring, err)
+			}
+			return nil
+		}, nil
+	}
+	return func() error { return r.Delete() }, nil
+}
+
 // Delete removes a keyring-backed secret. Env references are left alone.
 func (r SecretRef) Delete() error {
 	if r.Keyring == "" {
