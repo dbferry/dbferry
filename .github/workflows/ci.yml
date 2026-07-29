@@ -17,8 +17,8 @@ jobs:
     name: unit + vet + race
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
       - name: gofmt
@@ -32,8 +32,8 @@ jobs:
     name: integration + fault-injection + coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
 
@@ -67,7 +67,7 @@ jobs:
 
       - name: archive coverage profile
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: cover.out
@@ -80,7 +80,7 @@ jobs:
     name: build runtime image (pg_dump 14–18 + mysql client)
     runs-on: ubuntu-latest # amd64 — MySQL APT ships an amd64 client
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: build image
         run: docker build -t dbferry:ci .
       - name: verify bundled clients
