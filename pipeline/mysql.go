@@ -230,6 +230,9 @@ func (d *mysqlDriver) BuildDumpCommand(ctx context.Context) *exec.Cmd {
 		"--routines",
 		"--events",
 		"--triggers",
+		// End of options: a database legally named like an option ("--tab=/x")
+		// must never be parsed as one — that would be a file-write primitive.
+		"--",
 		d.src.database,
 	)
 	cmd := exec.CommandContext(ctx, "mysqldump", args...)
@@ -240,7 +243,10 @@ func (d *mysqlDriver) BuildDumpCommand(ctx context.Context) *exec.Cmd {
 func (d *mysqlDriver) BuildRestoreCommand(targetDB string) []string {
 	args := []string{"mysql", "-h", d.src.host, "-P", d.src.port, "-u", d.src.user, "--protocol=TCP"}
 	args = append(args, d.src.sslArgs()...)
-	return append(args, targetDB)
+	// --database=NAME, not a positional: the mysql client (unlike mysqldump)
+	// does not honor "--" end-of-options — an option-looking name after "--"
+	// still dies in its option parser (verified against the 9.6 client).
+	return append(args, "--database="+targetDB)
 }
 
 func (d *mysqlDriver) DumpFormat() string {

@@ -100,6 +100,29 @@ func TestMySQLDumpCommandKeepsSecretsOffArgv(t *testing.T) {
 	}
 }
 
+// TestMySQLDatabaseNeverParsedAsOption pins the end-of-options guard: a
+// database legally named like a mysqldump option must arrive after "--", or it
+// becomes a file-write primitive (--tab=/dir writes plaintext dumps to disk).
+func TestMySQLDatabaseNeverParsedAsOption(t *testing.T) {
+	d, err := newMySQLDriver("mysql://root:pw@h:3306/--tab=%2Ftmp%2Fevil")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := d.BuildDumpCommand(context.Background())
+	args := cmd.Args
+	last := args[len(args)-1]
+	if last != "--tab=/tmp/evil" || args[len(args)-2] != "--" {
+		t.Fatalf("database must be the sole argument after --: %q", args)
+	}
+
+	// The mysql client ignores "--" (unlike mysqldump), so the restore target
+	// must travel as --database=NAME to stay out of its option parser.
+	restore := d.BuildRestoreCommand("--init-command=DROP DATABASE x")
+	if restore[len(restore)-1] != "--database=--init-command=DROP DATABASE x" {
+		t.Fatalf("restore target must be passed via --database=: %q", restore)
+	}
+}
+
 // TestMySQLSSLModeReachesDriverAndTools pins the TLS path end to end: the
 // DSN's ssl-mode must land in the go-sql-driver config AND on the
 // mysqldump/mysql argv — a user with REQUIRE SSL fails auth (1045) if it is

@@ -84,6 +84,30 @@ func TestDumpCommandKeepsSecretsOffArgv(t *testing.T) {
 	}
 }
 
+// TestDumpCommandForwardsTLSParams pins DSN→pg_dump TLS parity: preflight
+// hands the full DSN to pgx (which honors sslrootcert etc.), so pg_dump must
+// see the same parameters — otherwise a managed-provider DSN with a CA file
+// passes doctor and test-connection, then fails every backup.
+func TestDumpCommandForwardsTLSParams(t *testing.T) {
+	src, err := parsePostgresDSN("postgres://u:p@h:25060/app?sslmode=verify-ca&sslrootcert=/etc/ssl/ca.pem&sslcert=/c.pem&sslkey=/k.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := src.dumpCommandWith(context.Background(), "pg_dump")
+	want := []string{
+		"PGSSLMODE=verify-ca",
+		"PGSSLROOTCERT=/etc/ssl/ca.pem",
+		"PGSSLCERT=/c.pem",
+		"PGSSLKEY=/k.pem",
+	}
+	env := strings.Join(cmd.Env, "\n")
+	for _, w := range want {
+		if !strings.Contains(env, w) {
+			t.Errorf("dump env missing %s", w)
+		}
+	}
+}
+
 func TestCappedBufferKeepsTail(t *testing.T) {
 	b := newCappedBuffer(5)
 	if _, err := b.Write([]byte("hello world")); err != nil {

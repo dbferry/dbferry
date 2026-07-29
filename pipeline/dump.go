@@ -19,6 +19,13 @@ type pgSource struct {
 	password string
 	database string
 	sslmode  string
+	// TLS material paths from the DSN. Preflight hands the full DSN to pgx,
+	// which honors these — pg_dump must see the exact same parameters or a
+	// managed-provider DSN with sslrootcert would pass every check and then
+	// fail every backup on a certificate error.
+	sslrootcert string
+	sslcert     string
+	sslkey      string
 }
 
 // parsePostgresDSN parses a postgres:// or postgresql:// URL into a pgSource.
@@ -44,13 +51,17 @@ func parsePostgresDSN(dsn string) (pgSource, error) {
 	}
 	password, _ := u.User.Password()
 
+	q := u.Query()
 	return pgSource{
-		host:     u.Hostname(),
-		port:     port,
-		user:     u.User.Username(),
-		password: password,
-		database: db,
-		sslmode:  u.Query().Get("sslmode"),
+		host:        u.Hostname(),
+		port:        port,
+		user:        u.User.Username(),
+		password:    password,
+		database:    db,
+		sslmode:     q.Get("sslmode"),
+		sslrootcert: q.Get("sslrootcert"),
+		sslcert:     q.Get("sslcert"),
+		sslkey:      q.Get("sslkey"),
 	}, nil
 }
 
@@ -80,6 +91,15 @@ func (s pgSource) dumpCommandWith(ctx context.Context, binary string) *exec.Cmd 
 	)
 	if s.sslmode != "" {
 		env = append(env, "PGSSLMODE="+s.sslmode)
+	}
+	if s.sslrootcert != "" {
+		env = append(env, "PGSSLROOTCERT="+s.sslrootcert)
+	}
+	if s.sslcert != "" {
+		env = append(env, "PGSSLCERT="+s.sslcert)
+	}
+	if s.sslkey != "" {
+		env = append(env, "PGSSLKEY="+s.sslkey)
 	}
 	cmd.Env = env
 	return cmd

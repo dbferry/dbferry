@@ -169,6 +169,19 @@ func (u *uploader) streamParts(ctx context.Context, bucket, key, uploadID string
 	var partNum int32
 	var readErr error
 
+	// A failed part cancels gctx, but the read loop may be parked inside
+	// io.ReadFull on the dump pipe — and if the dump itself has stalled, nothing
+	// ever writes to that pipe again. Closing the reader end on cancellation
+	// unblocks the read so the failure can surface and the multipart upload can
+	// be aborted instead of hanging the run forever. (gctx is also canceled when
+	// g.Wait returns, so this goroutine never outlives the call.)
+	if pipe, ok := body.(*io.PipeReader); ok {
+		go func() {
+			<-gctx.Done()
+			pipe.CloseWithError(gctx.Err())
+		}()
+	}
+
 	// Part buffers are pooled and the concurrency slot is acquired BEFORE a
 	// buffer is taken, so at most `concurrency` part buffers are ever live and
 	// they are reused rather than re-allocated. This bounds peak RSS to about

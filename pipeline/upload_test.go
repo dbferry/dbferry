@@ -175,6 +175,46 @@ func TestUploadPartFailureAbortsNoObject(t *testing.T) {
 	}
 }
 
+// TestUploadPartFailureUnblocksStalledPipe pins the anti-hang guard: when a
+// part fails while the dump has stalled (nothing will ever write to the pipe
+// again), the read loop must not sit in io.ReadFull forever — the failure has
+// to surface so the multipart upload gets aborted.
+func TestUploadPartFailureUnblocksStalledPipe(t *testing.T) {
+	f := newFakeS3()
+	f.onPart = func(pn int32) error { return errors.New("credentials revoked") }
+
+	pr, pw := io.Pipe()
+	go func() {
+		// One full part, then silence — a stalled dump mid-stream.
+		pw.Write(bytes.Repeat([]byte("x"), 10))
+	}()
+
+	u := newUploaderWithAPI(f, 10, 4, time.Minute)
+	done := make(chan error, 1)
+	go func() {
+		_, err := u.upload(context.Background(), "bucket", "key", pr, new(atomic.Int64))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected the part failure to surface")
+		}
+		if KindOf(err) != KindUpload {
+			t.Errorf("kind = %v, want upload", KindOf(err))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload hung on a stalled pipe after a part failure")
+	}
+	if f.object {
+		t.Error("no object must exist after a part failure")
+	}
+	if f.aborts == 0 {
+		t.Error("abort must have been attempted")
+	}
+}
+
 func TestAmbiguousCompleteReconcilesToSuccess(t *testing.T) {
 	f := newFakeS3()
 	f.onComplete = errors.New("i/o timeout reading complete response")
