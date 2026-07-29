@@ -1,0 +1,46 @@
+# Release configuration (goreleaser v2). Triggered by the release workflow on
+# v* tags: static binaries for the six supported platforms, archives with the
+# docs a user needs offline, and a checksums file. The container image is
+# built and pushed by the same workflow from the Dockerfile (amd64-only — the
+# MySQL APT repo ships no arm64 client), not by goreleaser.
+version: 2
+
+project_name: dbferry
+
+builds:
+  - main: ./cmd/dbferry
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - SECURITY.md
+      - docs/restore.md
+      - docs/connections.md
+      - docs/operations.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+
+release:
+  # v0.x tags are pre-release automatically; flip to stable at v1.
+  prerelease: auto
+  footer: |
+    **Verify your download**: `shasum -a 256 -c checksums.txt`
+
+    Container image: `docker pull ghcr.io/dbferry/dbferry:{{ .Tag }}` (linux/amd64,
+    bundles pg_dump 14–18 and the MySQL client).
