@@ -1,5 +1,7 @@
 # dbferry
 
+[![ci](https://github.com/dbferry/dbferry/actions/workflows/ci.yml/badge.svg)](https://github.com/dbferry/dbferry/actions/workflows/ci.yml)
+
 > Ships your databases to your own bucket. Every night. One by one.
 
 Per-database backups for managed PostgreSQL and MySQL — streamed, compressed,
@@ -19,6 +21,29 @@ dumps each database separately, so you can restore one without touching the rest
   Spaces, Cloudflare R2, Backblaze B2, MinIO)
 - Auto-discovers every database on the cluster; picks a matching `pg_dump`
   (PostgreSQL 14–18 supported)
+
+## Install
+
+No prebuilt binaries yet (pre-release). Build from source with Go 1.26+:
+
+```sh
+go install github.com/dbferry/dbferry/cmd/dbferry@latest
+```
+
+or clone and `make build`. A container image with `pg_dump` 14–18 and the MySQL
+client bundled can be built from the included [`Dockerfile`](Dockerfile)
+(`docker build --platform=linux/amd64 -t dbferry .`).
+
+### Requirements
+
+- **PostgreSQL sources**: `pg_dump` / `pg_restore` with a major version ≥ your
+  server's (14–18). dbferry checks Debian's versioned layout
+  (`/usr/lib/postgresql/<major>/bin`) first, then `PATH`, and picks a matching
+  client per server — `dbferry doctor` tells you if yours won't do.
+- **MySQL sources**: `mysqldump` on `PATH`.
+- Compression (zstd) and encryption (age) are built into the binary — nothing
+  else to install for backups. Restoring uses the standard `age` and `zstd`
+  CLI tools (see [Restore](#restore)).
 
 ## Quickstart
 
@@ -76,6 +101,13 @@ Restore is the inverse chain, documented step by step (download → `age -d` →
 - [Restoring a backup](docs/restore.md)
 - [Operating backups](docs/operations.md) — bucket lifecycle for incomplete uploads
 - [Architecture decisions](docs/adr)
+
+## Contributing
+
+Issues and PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev
+setup (one `make stand-up` gives you real PG 14/17, MySQL 8 and MinIO to test
+against) and the ground rules. It's pre-release: open an issue before building
+anything sizable.
 
 ## Security
 
