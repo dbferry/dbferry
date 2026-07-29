@@ -24,15 +24,20 @@ dumps each database separately, so you can restore one without touching the rest
 
 ## Install
 
-No prebuilt binaries yet (pre-release). Build from source with Go 1.26+:
+Prebuilt binaries for Linux, macOS and Windows (amd64/arm64) are on the
+[releases page](https://github.com/dbferry/dbferry/releases), with sha256
+checksums. Or build from source with Go 1.26+:
 
 ```sh
 go install github.com/dbferry/dbferry/cmd/dbferry@latest
 ```
 
-or clone and `make build`. A container image with `pg_dump` 14–18 and the MySQL
-client bundled can be built from the included [`Dockerfile`](Dockerfile)
-(`docker build --platform=linux/amd64 -t dbferry .`).
+The container image bundles `pg_dump` 14–18 and the MySQL client
+(linux/amd64):
+
+```sh
+docker pull ghcr.io/dbferry/dbferry:latest
+```
 
 ### Requirements
 

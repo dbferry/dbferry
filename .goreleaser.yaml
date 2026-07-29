@@ -37,8 +37,10 @@ changelog:
   use: github
 
 release:
-  # v0.x tags are pre-release automatically; flip to stable at v1.
-  prerelease: auto
+  # Everything before v1 is a pre-release. goreleaser's `auto` only reacts to
+  # tag suffixes (-rc1 etc.), not to the 0.x major — so say it explicitly and
+  # flip this at v1.0.0.
+  prerelease: "true"
   footer: |
     **Verify your download**: `shasum -a 256 -c checksums.txt`
 
