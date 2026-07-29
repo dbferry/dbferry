@@ -28,10 +28,13 @@ func cmdDoctor(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY boo
 		jsonOut    = fs.Bool("json", false, "print the checks as JSON")
 		noColor    = fs.Bool("no-color", false, "disable ANSI colour")
 	)
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	out := &ui{stdout: stdout, stderr: stderr, stdoutTTY: stdoutTTY, stderrTTY: stderrTTY, json: *jsonOut, color: !*noColor}
+	if *connName != "" && (*dsnFile != "" || *dest != "" || *s3Endpoint != "" || flagWasSet(fs, "dsn-env")) {
+		return out.fail(usageErr("choose either --connection or the standalone --dsn-env/--dsn-file/--dest/--s3-endpoint flags, not both"), redactNothing)
+	}
 
 	var (
 		red       config.Redactor
@@ -39,6 +42,10 @@ func cmdDoctor(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY boo
 		destCfg   pipeline.Config
 		hasDest   bool
 		recipient string
+		// destBroken carries a destination that could not even be resolved —
+		// doctor must report that as a failed check, not silently skip the
+		// thing it was asked to diagnose.
+		destBroken *pipeline.Check
 	)
 
 	if *connName != "" {
@@ -58,9 +65,19 @@ func cmdDoctor(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY boo
 		dsn = d
 		recipient = conn.AgeRecipient
 		if conn.Destination != "" {
-			if dst := cfg.Destinations[conn.Destination]; dst != nil {
+			dst := cfg.Destinations[conn.Destination]
+			switch {
+			case dst == nil:
+				destBroken = &pipeline.Check{Name: "destination", Status: pipeline.StatusFail,
+					Detail: fmt.Sprintf("connection references destination %q, which does not exist", conn.Destination),
+					Fix:    "add it with `dbferry destinations add` or point the connection at an existing one"}
+			default:
 				s3, dsecrets, rerr := dst.Resolve()
-				if rerr == nil {
+				if rerr != nil {
+					destBroken = &pipeline.Check{Name: "destination", Status: pipeline.StatusFail,
+						Detail: fmt.Sprintf("destination %q: %v", conn.Destination, rerr),
+						Fix:    "export the referenced credential env vars (or fix the destination entry)"}
+				} else {
 					red.Add(dsecrets...)
 					destCfg = destProbeConfig(dst, s3)
 					hasDest = true
@@ -89,6 +106,9 @@ func cmdDoctor(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY boo
 	checks := pipeline.DiagnoseSource(ctx, dsn)
 	if hasDest {
 		checks = append(checks, pipeline.DiagnoseDestination(ctx, destCfg)...)
+	}
+	if destBroken != nil {
+		checks = append(checks, *destBroken)
 	}
 	if recipient != "" {
 		if _, err := age.ParseX25519Recipient(recipient); err != nil {

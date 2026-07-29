@@ -28,7 +28,39 @@ func newFlagSet(name string, out io.Writer) *flag.FlagSet {
 	return fs
 }
 
+// parseFlags parses args and reports how the caller should proceed: asking for
+// help (-h/--help) is a success (exit 0), a real flag error is exit 1, and
+// leftover positionals are refused — `run --connection prod extradb` silently
+// backing up the default database instead of "extradb" would be a lie.
+func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
+	switch err := fs.Parse(args); {
+	case err == nil:
+	case errors.Is(err, flag.ErrHelp):
+		return 0, false
+	default:
+		return 1, false // the flag package already printed the error
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(fs.Output(), "dbferry %s: unexpected argument %q\n", fs.Name(), fs.Arg(0))
+		return 1, false
+	}
+	return 0, true
+}
+
 func usageErr(msg string) error { return errors.New(msg) }
+
+// flagWasSet reports whether the user explicitly set a flag (as opposed to it
+// holding its default). Lets commands refuse contradictory combinations like
+// `--connection X --dsn-env Y` instead of silently ignoring one of them.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
 
 // --- progress reporter ----------------------------------------------------
 
@@ -150,6 +182,9 @@ func (u *ui) writeJSONValue(v any) {
 // (not hidden) so a missing grant is visible.
 func (u *ui) databases(dbs []pipeline.DatabaseInfo) {
 	if u.json {
+		if dbs == nil {
+			dbs = []pipeline.DatabaseInfo{} // "databases": [] — never null
+		}
 		u.writeJSONValue(struct {
 			OK        bool                    `json:"ok"`
 			Databases []pipeline.DatabaseInfo `json:"databases"`

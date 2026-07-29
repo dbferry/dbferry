@@ -71,6 +71,10 @@ func run(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int
 	case "doctor":
 		return cmdDoctor(args[1:], stdout, stderr, stdoutTTY, stderrTTY)
 	case "version", "--version", "-v":
+		if len(args) > 1 {
+			fmt.Fprintf(stderr, "dbferry version: unexpected argument %q\n", args[1])
+			return 1
+		}
 		fmt.Fprintln(stdout, version)
 		return 0
 	case "help", "-h", "--help":
@@ -102,8 +106,8 @@ func cmdRun(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) 
 		quiet        = fs.Bool("quiet", false, "suppress progress and the success summary; only errors are printed")
 		noColor      = fs.Bool("no-color", false, "disable ANSI colour")
 	)
-	if err := fs.Parse(args); err != nil {
-		return 1 // flag package already reported the error
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 
 	out := &ui{
@@ -124,8 +128,8 @@ func cmdRun(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) 
 	)
 
 	if *connName != "" {
-		if *dsnFile != "" {
-			return out.fail(usageErr("choose either --connection or --dsn-file, not both"), redactNothing)
+		if *dsnFile != "" || flagWasSet(fs, "dsn-env") {
+			return out.fail(usageErr("choose either --connection or --dsn-env/--dsn-file, not both"), redactNothing)
 		}
 		cfg, lerr := config.Load(configPath(*cfgPath))
 		if lerr != nil {
@@ -236,8 +240,8 @@ func resolveDSN(envName, file string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("--dsn-file: %w", err)
 		}
-		if perm := info.Mode().Perm(); perm&0o077 != 0 {
-			return "", fmt.Errorf("--dsn-file %s has insecure permissions %#o; want 0600", file, perm)
+		if err := config.RequirePrivate("--dsn-file", file, info); err != nil {
+			return "", err
 		}
 		b, err := os.ReadFile(file)
 		if err != nil {

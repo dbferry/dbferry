@@ -15,7 +15,9 @@ import (
 var stdinReader = bufio.NewReader(os.Stdin)
 
 // readLineNoEcho reads one line of secret input: hidden (no echo) from a
-// terminal, or plainly from piped stdin for scripts.
+// terminal, or plainly from piped stdin for scripts. Only the line ending is
+// stripped — a password with leading or trailing spaces must arrive intact,
+// or auth fails later with no hint of why.
 func readLineNoEcho() string {
 	fd := int(os.Stdin.Fd())
 	if term.IsTerminal(fd) {
@@ -24,10 +26,10 @@ func readLineNoEcho() string {
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(string(b))
+		return strings.TrimRight(string(b), "\r\n")
 	}
 	line, _ := stdinReader.ReadString('\n')
-	return strings.TrimSpace(line)
+	return strings.TrimRight(line, "\r\n")
 }
 
 // promptLine prints a label and reads a visible line (for non-secret input).

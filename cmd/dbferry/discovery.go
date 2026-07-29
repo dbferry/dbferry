@@ -33,6 +33,15 @@ func registerConnFlags(fs *flag.FlagSet) connFlags {
 	}
 }
 
+// conflict reports a contradictory flag combination: a named connection plus
+// explicit --dsn-* flags would silently ignore one of the two sources.
+func (c connFlags) conflict(fs *flag.FlagSet) error {
+	if *c.connName != "" && (*c.dsnFile != "" || flagWasSet(fs, "dsn-env")) {
+		return usageErr("choose either --connection or --dsn-env/--dsn-file, not both")
+	}
+	return nil
+}
+
 // source resolves the DSN to connect with (a named connection's connect DSN, or
 // --dsn-*) plus a redactor covering its secrets.
 func (c connFlags) source() (dsn string, redact func(string) string, err error) {
@@ -78,11 +87,13 @@ func (c connFlags) ui(stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) *ui {
 func cmdTestConnection(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int {
 	fs := newFlagSet("test-connection", stderr)
 	cf := registerConnFlags(fs)
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	out := cf.ui(stdout, stderr, stdoutTTY, stderrTTY)
-
+	if err := cf.conflict(fs); err != nil {
+		return out.fail(err, redactNothing)
+	}
 	dsn, redact, err := cf.source()
 	if err != nil {
 		return out.fail(err, redactNothing)
@@ -107,11 +118,13 @@ func cmdTestConnection(args []string, stdout, stderr io.Writer, stdoutTTY, stder
 func cmdDatabases(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int {
 	fs := newFlagSet("databases", stderr)
 	cf := registerConnFlags(fs)
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	out := cf.ui(stdout, stderr, stdoutTTY, stderrTTY)
-
+	if err := cf.conflict(fs); err != nil {
+		return out.fail(err, redactNothing)
+	}
 	dsn, redact, err := cf.source()
 	if err != nil {
 		return out.fail(err, redactNothing)

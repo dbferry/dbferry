@@ -21,15 +21,25 @@ func configPath(override string) string {
 
 // splitName takes the leading positional <name> then parses the remaining
 // flags, so commands read naturally as `add <name> --flags` (Go's flag package
-// otherwise stops at the first positional).
-func splitName(args []string, fs *flag.FlagSet) (name string, ok bool) {
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		return "", false
+// otherwise stops at the first positional). When ok is false, code is the exit
+// code to use; a code of 1 with nothing yet printed means "no name given" and
+// the caller should show its usage line.
+func splitName(args []string, fs *flag.FlagSet) (name string, code int, ok bool) {
+	if len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		// No leading name — still run the parser so -h/--help works (exit 0)
+		// and flag typos get a real error message.
+		if c, pok := parseFlags(fs, args); !pok {
+			return "", c, false
+		}
+		return "", 1, false
 	}
-	if err := fs.Parse(args[1:]); err != nil {
-		return "", false
+	if len(args) == 0 {
+		return "", 1, false
 	}
-	return args[0], true
+	if c, pok := parseFlags(fs, args[1:]); !pok {
+		return "", c, false
+	}
+	return args[0], 0, true
 }
 
 // --- connections ----------------------------------------------------------
@@ -48,6 +58,9 @@ func cmdConnections(args []string, stdout, stderr io.Writer) int {
 		return connectionsAdd(args[1:], stdout, stderr)
 	case "rm", "remove":
 		return connectionsRm(args[1:], stdout, stderr)
+	case "help", "-h", "--help":
+		fmt.Fprintln(stdout, "usage: dbferry connections <list|show|add|rm> ...")
+		return 0
 	default:
 		fmt.Fprintf(stderr, "dbferry: unknown connections subcommand %q\n", args[0])
 		return 1
@@ -57,8 +70,8 @@ func cmdConnections(args []string, stdout, stderr io.Writer) int {
 func connectionsList(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("connections list", stderr)
 	cfgPath := fs.String("config", "", "config file path")
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	cfg, err := config.Load(configPath(*cfgPath))
 	if err != nil {
@@ -80,10 +93,12 @@ func connectionsList(args []string, stdout, stderr io.Writer) int {
 func connectionsShow(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("connections show", stderr)
 	cfgPath := fs.String("config", "", "config file path")
-	name, ok := splitName(args, fs)
+	name, code, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry connections show <name>")
-		return 1
+		if code == 1 {
+			fmt.Fprintln(stderr, "usage: dbferry connections show <name>")
+		}
+		return code
 	}
 	cfg, err := config.Load(configPath(*cfgPath))
 	if err != nil {
@@ -112,10 +127,12 @@ func connectionsAdd(args []string, stdout, stderr io.Writer) int {
 		destination  = fs.String("destination", "", "default destination name")
 		ageRecipient = fs.String("age-recipient", "", "age public recipient")
 	)
-	name, ok := splitName(args, fs)
+	name, code, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry connections add <name> --dsn ... (--password-keyring NAME | --password-env VAR)")
-		return 1
+		if code == 1 {
+			fmt.Fprintln(stderr, "usage: dbferry connections add <name> --dsn ... (--password-keyring NAME | --password-env VAR)")
+		}
+		return code
 	}
 	if *dsn == "" {
 		fmt.Fprintln(stderr, "dbferry: --dsn is required")
@@ -159,17 +176,22 @@ func connectionsAdd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Store secret first, then config; roll back the keychain entry if the
-	// config write fails, so no orphan secret is left behind.
+	// Store secret first, then config; if the config write fails, put the
+	// keychain back exactly as it was (an existing entry under this name may
+	// belong to a configured connection — deleting it would destroy the only
+	// copy of that password).
+	rollback := func() error { return nil }
 	if *pwKeyring != "" {
-		if err := conn.Password.Store(password); err != nil {
+		var err error
+		rollback, err = conn.Password.StoreWithRollback(password)
+		if err != nil {
 			fmt.Fprintln(stderr, "dbferry: "+err.Error())
 			return 1
 		}
 	}
 	if err := upsertConnection(configPath(*cfgPath), name, conn); err != nil {
-		if *pwKeyring != "" {
-			_ = conn.Password.Delete()
+		if rerr := rollback(); rerr != nil {
+			fmt.Fprintf(stderr, "dbferry: warning: %v — the keychain entry %q now holds the NEW password\n", rerr, *pwKeyring)
 		}
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
@@ -182,10 +204,12 @@ func connectionsRm(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("connections rm", stderr)
 	cfgPath := fs.String("config", "", "config file path")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt (required for non-interactive use)")
-	name, ok := splitName(args, fs)
+	name, code, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry connections rm <name> [--yes]")
-		return 1
+		if code == 1 {
+			fmt.Fprintln(stderr, "usage: dbferry connections rm <name> [--yes]")
+		}
+		return code
 	}
 	path := configPath(*cfgPath)
 	// Hold the lock across load → mutate → write so a concurrent add/rm can't
@@ -253,6 +277,9 @@ func cmdDestinations(args []string, stdout, stderr io.Writer) int {
 		return destinationsAdd(args[1:], stdout, stderr)
 	case "rm", "remove":
 		return destinationsRm(args[1:], stdout, stderr)
+	case "help", "-h", "--help":
+		fmt.Fprintln(stdout, "usage: dbferry destinations <list|show|add|rm> ...")
+		return 0
 	default:
 		fmt.Fprintf(stderr, "dbferry: unknown destinations subcommand %q\n", args[0])
 		return 1
@@ -262,8 +289,8 @@ func cmdDestinations(args []string, stdout, stderr io.Writer) int {
 func destinationsList(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("destinations list", stderr)
 	cfgPath := fs.String("config", "", "config file path")
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	cfg, err := config.Load(configPath(*cfgPath))
 	if err != nil {
@@ -285,10 +312,12 @@ func destinationsList(args []string, stdout, stderr io.Writer) int {
 func destinationsShow(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("destinations show", stderr)
 	cfgPath := fs.String("config", "", "config file path")
-	name, ok := splitName(args, fs)
+	name, code, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry destinations show <name>")
-		return 1
+		if code == 1 {
+			fmt.Fprintln(stderr, "usage: dbferry destinations show <name>")
+		}
+		return code
 	}
 	cfg, err := config.Load(configPath(*cfgPath))
 	if err != nil {
@@ -319,10 +348,12 @@ func destinationsAdd(args []string, stdout, stderr io.Writer) int {
 		skEnv    = fs.String("secret-key-env", "", "secret key as an env reference")
 		stEnv    = fs.String("session-token-env", "", "session token as an env reference (STS)")
 	)
-	name, ok := splitName(args, fs)
+	name, code, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry destinations add <name> --bucket ... [--endpoint ... --region ... --access-key-env ... --secret-key-env ...]")
-		return 1
+		if code == 1 {
+			fmt.Fprintln(stderr, "usage: dbferry destinations add <name> --bucket ... [--endpoint ... --region ... --access-key-env ... --secret-key-env ...]")
+		}
+		return code
 	}
 	if *bucket == "" {
 		fmt.Fprintln(stderr, "dbferry: --bucket is required")
@@ -369,10 +400,12 @@ func destinationsRm(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("destinations rm", stderr)
 	cfgPath := fs.String("config", "", "config file path")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt (required for non-interactive use)")
-	name, ok := splitName(args, fs)
+	name, code, ok := splitName(args, fs)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dbferry destinations rm <name> [--yes]")
-		return 1
+		if code == 1 {
+			fmt.Fprintln(stderr, "usage: dbferry destinations rm <name> [--yes]")
+		}
+		return code
 	}
 	path := configPath(*cfgPath)
 	unlock, err := config.Lock(path)

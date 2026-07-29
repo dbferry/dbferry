@@ -19,8 +19,8 @@ import (
 func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("keygen", stderr)
 	out := fs.String("out", "", "path to write the age identity (required)")
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	if *out == "" {
 		fmt.Fprintln(stderr, "usage: dbferry keygen --out PATH")
@@ -39,11 +39,25 @@ func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dbferry: generate identity: %v\n", err)
 		return 1
 	}
-	if _, err := fmt.Fprintln(f, id.String()); err != nil {
-		f.Close()
+	// Write, sync, close — and never leave a partial identity file behind: an
+	// unusable 0-byte file would also block every retry via O_EXCL. Sync
+	// matters here more than anywhere: this is the only key that can decrypt
+	// the backups, and the recipient printed below may be used immediately.
+	werr := func() error {
+		if _, err := fmt.Fprintln(f, id.String()); err != nil {
+			return err
+		}
+		return f.Sync()
+	}()
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		os.Remove(*out)
+		if werr == nil {
+			werr = cerr
+		}
+		fmt.Fprintf(stderr, "dbferry: write identity to %s: %v\n", *out, werr)
 		return 1
 	}
-	f.Close()
 	fmt.Fprintf(stdout, "wrote identity to %s (0600)\nrecipient: %s\n\n"+
 		"KEEP THIS FILE SAFE. It is the only key that can decrypt your backups —\n"+
 		"dbferry never holds it. Store a copy in a password manager and offline.\n",
@@ -56,8 +70,8 @@ func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 func cmdInit(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool) int {
 	fs := newFlagSet("init", stderr)
 	cfgPath := fs.String("config", "", "config file path")
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
 	}
 	path := configPath(*cfgPath)
 
@@ -101,9 +115,17 @@ func cmdInit(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool)
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
 	}
+	// Defense in depth: no pipeline error embeds the DSN today, but a future
+	// wrapped error that does must not print the live password. Register the
+	// userinfo encoding url.UserPassword actually produces (query escaping
+	// differs: a space is %20 in userinfo but + in a query).
+	var red config.Redactor
+	red.Add(password,
+		strings.TrimPrefix(url.UserPassword("", password).String(), ":"),
+		url.QueryEscape(password), testDSN)
 	ctx := context.Background()
 	if err := pipeline.TestConnection(ctx, testDSN); err != nil {
-		fmt.Fprintf(stderr, "dbferry: connection failed: %v\n", err)
+		fmt.Fprintf(stderr, "dbferry: connection failed: %s\n", red.Redact(err.Error()))
 		return 1
 	}
 	fmt.Fprintln(stderr, "  ✓ connection ok")
@@ -141,29 +163,39 @@ func cmdInit(args []string, stdout, stderr io.Writer, stdoutTTY, stderrTTY bool)
 		return 1
 	}
 
-	// Store keychain secret first, then config; roll back on failure.
+	// Store keychain secret first, then config; if the save fails, put the
+	// keychain back exactly as it was — re-running init for an existing
+	// connection must not destroy its stored password on a config error.
+	rollback := func() error { return nil }
+	warnRollback := func() {
+		if rerr := rollback(); rerr != nil {
+			fmt.Fprintf(stderr, "dbferry: warning: %v — the keychain entry %q now holds the NEW password\n", rerr, pwRef.Keyring)
+		}
+	}
 	if pwRef.Keyring != "" {
-		if err := pwRef.Store(password); err != nil {
+		var err error
+		rollback, err = pwRef.StoreWithRollback(password)
+		if err != nil {
 			fmt.Fprintln(stderr, "dbferry: "+err.Error())
 			return 1
 		}
 	}
 	unlock, err := config.Lock(path)
 	if err != nil {
-		_ = pwRef.Delete()
+		warnRollback()
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
 	}
 	defer unlock()
 	cfg, err := config.Load(path)
 	if err != nil {
-		_ = pwRef.Delete()
+		warnRollback()
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
 	}
 	cfg.Connections[name] = conn
 	if err := cfg.SaveLocked(path); err != nil {
-		_ = pwRef.Delete()
+		warnRollback()
 		fmt.Fprintln(stderr, "dbferry: "+err.Error())
 		return 1
 	}
