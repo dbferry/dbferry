@@ -38,6 +38,25 @@ func myIdent(s string) string {
 	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
 }
 
+// myGrantDB quotes a database name for a database-level GRANT ... ON db.*
+// clause. There — and only there — MySQL treats `_` and `%` as LIKE-style
+// wildcards even inside backticks, so a grant on `my_db`.* silently also
+// covers a sibling `my1db`. Escaping with a backslash makes them literal.
+// Caveat (verified against MySQL 8.4): with partial_revokes=ON the escape
+// character is itself literal, so the escaped form names the wrong database —
+// callers must offer the unescaped form for that case (wildcards are already
+// off there, so it is safe).
+func myGrantDB(s string) string {
+	s = strings.NewReplacer(`\`, `\\`, "_", `\_`, "%", `\%`).Replace(s)
+	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
+}
+
+// myGrantNeedsEscape reports whether a database name contains characters that
+// are LIKE wildcards (or their escape) in a database-level GRANT.
+func myGrantNeedsEscape(s string) bool {
+	return strings.ContainsAny(s, `_%\`)
+}
+
 // myString quotes a MySQL string literal: both quote AND backslash must be
 // escaped (default sql_mode treats backslash as an escape character).
 func myString(s string) string {
@@ -115,21 +134,41 @@ func MySQLGrants(user, database string) (string, error) {
 	if err := validIdent("database", database); err != nil {
 		return "", err
 	}
-	u, d := myString(user), myIdent(database)
+	u, d := myString(user), myGrantDB(database)
+	grantSection := fmt.Sprintf(`-- 2. Read access to the database being backed up:
+GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %[2]s.* TO '%[1]s'@'%%';
+`, u, d)
+	if myGrantNeedsEscape(database) {
+		// In a database-level GRANT, _ and % are LIKE wildcards even inside
+		// backticks — unescaped, this grant would also cover sibling databases
+		// (my_db would match my1db). But with partial_revokes=ON the server
+		// takes names literally, escape character included, so each mode needs
+		// its own spelling of the same database.
+		grantSection = fmt.Sprintf(`-- 2. Read access to the database being backed up. In database-level
+--    grants MySQL treats _ and %% as wildcards unless partial_revokes is ON,
+--    so the right spelling depends on your server. Check it first:
+--
+--      SELECT @@partial_revokes;
+--
+--    If it returns 0 (the default), the wildcard characters must be escaped
+--    so the grant covers exactly this database and no look-alikes:
+GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %[2]s.* TO '%[1]s'@'%%';
+--    If it returns 1, names are literal — run this instead:
+--      GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %[3]s.* TO '%[1]s'@'%%';
+`, u, d, myIdent(database))
+	}
 	return fmt.Sprintf(`-- Run as an administrative user.
 -- 1. The backup user. The server GENERATES the password and prints it in
 --    the result — copy it into dbferry now, it is shown only once:
 CREATE USER '%[1]s'@'%%' IDENTIFIED BY RANDOM PASSWORD;
 
--- 2. Read access to the database being backed up:
-GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %[2]s.* TO '%[1]s'@'%%';
-
+%[2]s
 -- 3. Stored procedures/functions in the dump (MySQL 8.0.20+):
 GRANT SHOW_ROUTINE ON *.* TO '%[1]s'@'%%';
 -- (on older servers use instead: GRANT SELECT ON mysql.proc TO '%[1]s'@'%%';)
 
 FLUSH PRIVILEGES;
-`, u, d), nil
+`, u, grantSection), nil
 }
 
 // ValidatePrefix rejects prefixes that would break or broaden the generated
@@ -151,6 +190,9 @@ func ValidatePrefix(prefix string) (string, error) {
 	}
 	if strings.Contains(p, "%") {
 		return "", fmt.Errorf("prefix must not contain percent signs (URL-encoding is ambiguous across S3 tools)")
+	}
+	if strings.Contains(p, "${") {
+		return "", fmt.Errorf("prefix must not contain IAM policy variables (${...})")
 	}
 	for _, r := range p {
 		if r < 0x20 || r == 0x7f {

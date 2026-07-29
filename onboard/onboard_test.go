@@ -93,11 +93,45 @@ func TestMySQLGrants(t *testing.T) {
 	}
 }
 
+// TestMySQLGrantsEscapeWildcards pins the database-level GRANT wildcard trap
+// (verified live against MySQL 8.4): unescaped, ON `my_db`.* also covers a
+// sibling my1db; escaped `my\_db` is exact — but with partial_revokes=ON the
+// escaped spelling names the wrong database, so the script must offer both.
+func TestMySQLGrantsEscapeWildcards(t *testing.T) {
+	sql, err := MySQLGrants("backup", "my_db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sql, "ON `my\\_db`.*") {
+		t.Errorf("wildcard _ not escaped in database-level grant:\n%s", sql)
+	}
+	if !strings.Contains(sql, "ON `my_db`.*") || !strings.Contains(sql, "partial_revokes") {
+		t.Errorf("missing literal partial_revokes=ON alternative:\n%s", sql)
+	}
+
+	// A clean name gets the plain single-grant script — no confusing caveat.
+	clean, err := MySQLGrants("backup", "shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(clean, "partial_revokes") {
+		t.Errorf("clean name must not carry the wildcard caveat:\n%s", clean)
+	}
+
+	pct, err := MySQLGrants("backup", "100%db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(pct, "ON `100\\%db`.*") {
+		t.Errorf("wildcard %% not escaped:\n%s", pct)
+	}
+}
+
 func TestValidatePrefix(t *testing.T) {
 	// Percent signs are banned as a class: the pipeline URL-parses the
 	// destination, so team%2Fprod / %2e%2e / %2a would decode into exactly
 	// the separators and wildcards the literal checks reject.
-	for _, bad := range []string{"a*", "a?b", "a//b", "a/../b", "..", ".", "team%2Fprod", "%2e%2e", "a%2ab", "100%", "a\nb"} {
+	for _, bad := range []string{"a*", "a?b", "a//b", "a/../b", "..", ".", "team%2Fprod", "%2e%2e", "a%2ab", "100%", "a\nb", "team-${aws:username}"} {
 		if _, err := ValidatePrefix(bad); err == nil {
 			t.Errorf("prefix %q accepted", bad)
 		}
