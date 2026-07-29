@@ -9,7 +9,7 @@
 # driver package to COVER_PKGS when it lands (poc-plan 4.1).
 set -euo pipefail
 
-THRESHOLD="${COVER_THRESHOLD:-80}"
+THRESHOLD="${COVER_THRESHOLD:-85}"
 COVER_PKGS="github.com/dbferry/dbferry/pipeline,github.com/dbferry/dbferry/config"
 
 # Profile path is kept (gitignored *.out) so CI can archive it as an artifact.
