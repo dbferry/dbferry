@@ -31,10 +31,14 @@ RUN set -eux; \
         https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list; \
-    # MySQL APT for the genuine mysqldump. MySQL's 2023 signing key is currently
-    # expired upstream, so verification is via HTTPS transport with [trusted=yes]
-    # instead of the (expired) repo signature.
-    echo "deb [trusted=yes] https://repo.mysql.com/apt/debian/ bookworm mysql-8.4-lts" \
+    # MySQL APT for the genuine mysqldump, signature-verified: Oracle's
+    # RPM-GPG-KEY-mysql-2025 is the same release key with the expiry extended
+    # to 2027 (the -2023 file upstream still carries the old, expired
+    # self-signature). Pin the fingerprint so a swapped key fails the build.
+    curl -fsSL -o /usr/share/keyrings/mysql.asc https://repo.mysql.com/RPM-GPG-KEY-mysql-2025; \
+    gpg --show-keys --with-colons /usr/share/keyrings/mysql.asc \
+        | grep -q '^fpr:::::::::BCA43417C3B485DD128EC6D4B7B3B788A8D3785C:$'; \
+    echo "deb [signed-by=/usr/share/keyrings/mysql.asc] https://repo.mysql.com/apt/debian/ bookworm mysql-8.4-lts" \
         > /etc/apt/sources.list.d/mysql.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
