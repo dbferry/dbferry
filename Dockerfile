@@ -47,5 +47,12 @@ RUN set -eux; \
     apt-get purge -y curl gnupg; apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
 
+# OCI metadata: links the ghcr package to the repo automatically and fills
+# the package page description.
+LABEL org.opencontainers.image.source="https://github.com/dbferry/dbferry" \
+      org.opencontainers.image.description="Per-database backups for managed PostgreSQL/MySQL — dump | zstd | age | S3, to your own bucket. Bundles pg_dump 14-18 and the MySQL client." \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.url="https://dbferry.io"
+
 COPY --from=build /out/dbferry /usr/local/bin/dbferry
 ENTRYPOINT ["dbferry"]
