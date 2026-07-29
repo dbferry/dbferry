@@ -181,9 +181,34 @@ func pgRestore(t *testing.T, archive []byte, targetDSN string) (string, error) {
 	}
 	f.Close()
 
-	cmd := exec.Command("pg_restore", "-d", targetDSN, "--no-owner", f.Name())
+	cmd := exec.Command(findPgRestore(), "-d", targetDSN, "--no-owner", f.Name())
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// findPgRestore picks the newest versioned pg_restore (PGDG layout,
+// /usr/lib/postgresql/<major>/bin) and falls back to PATH. A bare PATH lookup
+// is not enough on CI: the runner image preinstalls an older client that
+// shadows the installed one, and archive-format bumps land in MINOR releases
+// (pg_dump 17.10 writes format 1.16, which a stale pg_restore rejects with
+// "unsupported version in file header") — mirroring the pipeline's own
+// version-matched client selection keeps the restore side honest too.
+func findPgRestore() string {
+	matches, _ := filepath.Glob("/usr/lib/postgresql/*/bin/pg_restore")
+	best, bestMajor := "", -1
+	for _, m := range matches {
+		major, err := strconv.Atoi(filepath.Base(filepath.Dir(filepath.Dir(m))))
+		if err != nil {
+			continue
+		}
+		if major > bestMajor {
+			best, bestMajor = m, major
+		}
+	}
+	if best != "" {
+		return best
+	}
+	return "pg_restore"
 }
 
 // --- postgres helpers -----------------------------------------------------

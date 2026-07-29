@@ -37,7 +37,11 @@ jobs:
         with:
           go-version: '1.26'
 
-      # pg_dump/pg_restore must be >= the newest server in the stand (PG 17);
+      # pg_dump/pg_restore must be >= the newest server in the stand (PG 17),
+      # and FRESH: archive-format bumps land in minor releases (pg_dump 17.10
+      # writes format 1.16), so the runner's preinstalled stale client cannot
+      # be trusted. Installing 17 AND 18 from PGDG guarantees the versioned-dir
+      # lookup (pipeline + test helpers) always finds a current client.
       # mysqldump/mysql for the MySQL roundtrip.
       - name: install database clients
         run: |
@@ -47,7 +51,7 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
-          sudo apt-get install -y postgresql-client-17 default-mysql-client
+          sudo apt-get install -y postgresql-client-17 postgresql-client-18 default-mysql-client
 
       - name: bring up the stand
         run: make stand-up
