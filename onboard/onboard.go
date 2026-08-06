@@ -154,28 +154,34 @@ func MySQLGrants(user string, databases ...string) (string, error) {
 	grants.WriteString("-- 2. Read access to the database(s) being backed up:\n")
 	var escaped []string // databases whose grant spelling depends on partial_revokes
 	for _, d := range databases {
-		fmt.Fprintf(&grants, "GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %s.* TO '%s'@'%%';\n", myGrantDB(d), u)
 		if myGrantNeedsEscape(d) {
 			escaped = append(escaped, d)
+			continue
 		}
+		fmt.Fprintf(&grants, "GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %s.* TO '%s'@'%%';\n", myGrantDB(d), u)
 	}
 	if len(escaped) > 0 {
-		// In a database-level GRANT, _ and % are LIKE wildcards even inside
-		// backticks — unescaped, such a grant would also cover sibling
-		// databases (my_db would match my1db), so the lines above escape
-		// them. But with partial_revokes=ON the server takes names literally,
-		// escape character included, so that mode needs the literal spelling.
+		// In a database-level GRANT, _ and % are LIKE wildcards (and \ their
+		// escape) even inside backticks — unescaped, such a grant would also
+		// cover sibling databases (my_db would match my1db). But with
+		// partial_revokes=ON the server takes names literally, escape
+		// character included, so the two modes need DIFFERENT spellings of
+		// the same name. Neither variant is emitted as executable SQL: a
+		// blind run must fail loudly (no grant) rather than silently grant
+		// the wrong database.
 		grants.WriteString(`--
--- Some names above contain _ or %, which database-level grants treat as
--- LIKE wildcards unless partial_revokes is ON — the lines above use the
--- escaped spelling for the default mode. Check your server:
+-- The names below contain _, % or \ — characters database-level grants
+-- treat as LIKE wildcards (or their escape) unless partial_revokes is ON,
+-- and the two server modes need DIFFERENT spellings of the same name.
+-- Check the mode first, then uncomment and run exactly ONE line per
+-- database:
 --
 --      SELECT @@partial_revokes;
 --
--- If it returns 1, names are literal — run these instead for those databases:
 `)
 		for _, d := range escaped {
-			fmt.Fprintf(&grants, "--      GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %s.* TO '%s'@'%%';\n", myIdent(d), u)
+			fmt.Fprintf(&grants, "-- if 0 (default): GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %s.* TO '%s'@'%%';\n", myGrantDB(d), u)
+			fmt.Fprintf(&grants, "-- if 1:           GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON %s.* TO '%s'@'%%';\n", myIdent(d), u)
 		}
 	}
 	return fmt.Sprintf(`-- Run as an administrative user.

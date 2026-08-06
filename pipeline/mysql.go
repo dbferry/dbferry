@@ -63,6 +63,24 @@ func parseMySQLDSN(dsn string) (mysqlSource, error) {
 		return mysqlSource{}, classify(KindConnect,
 			"pipeline: unsupported ssl-mode %q (use DISABLED, PREFERRED, REQUIRED, VERIFY_CA or VERIFY_IDENTITY)", sslMode)
 	}
+	// tls= is the go-sql-driver spelling that managed providers hand out in
+	// their connection strings (DO uses ?tls=true). Silently dropping it
+	// would fail open — a DSN that asks for TLS must get TLS or an error.
+	if tlsParam := strings.ToLower(u.Query().Get("tls")); tlsParam != "" {
+		mapped, ok := map[string]string{
+			"true": "REQUIRED", "false": "DISABLED",
+			"skip-verify": "REQUIRED", "preferred": "PREFERRED",
+		}[tlsParam]
+		if !ok {
+			return mysqlSource{}, classify(KindConnect,
+				"pipeline: unsupported tls value %q (use true, false, skip-verify or preferred — or the ssl-mode parameter)", tlsParam)
+		}
+		if sslMode != "" && sslMode != mapped {
+			return mysqlSource{}, classify(KindConnect,
+				"pipeline: conflicting ssl-mode=%s and tls=%s — set only one", sslMode, tlsParam)
+		}
+		sslMode = mapped
+	}
 	pw, _ := u.User.Password()
 	return mysqlSource{
 		host:     u.Hostname(),
@@ -307,42 +325,76 @@ func (d *mysqlDriver) diagnoseRoutineAccess(ctx context.Context) Check {
 		Fix:    "GRANT SHOW_ROUTINE ON *.* TO the backup user (MySQL 8.0.20+; older servers: GRANT SELECT ON mysql.proc)"}
 }
 
-// hasRoutineGrant reports whether any SHOW GRANTS line lets the user read
-// stored program definitions: SHOW_ROUTINE (8.0.20+), a global ALL or SELECT,
-// or the pre-8.0.20 SELECT on mysql.proc. Matching is deliberately
+// hasRoutineGrant reports whether the SHOW GRANTS output proves the user can
+// read stored program definitions: SHOW_ROUTINE (8.0.20+), a global ALL or
+// SELECT, or the pre-8.0.20 SELECT on mysql.proc. Matching is deliberately
 // conservative — an unrecognized-but-sufficient grant yields a warn, never
-// the reverse.
+// the reverse. Two adversarial shapes are handled explicitly:
+//
+//   - role-assignment rows (GRANT `role`@`%` TO ...) carry no privilege
+//     list, but a hostile role NAME may contain "SHOW_ROUTINE ON *.*";
+//     any quote character in the would-be privilege list disqualifies the
+//     row, so cutting inside a quoted identifier can never fake a match;
+//   - partial revokes (REVOKE SELECT ON `db`.* is listed as its own row):
+//     any SELECT/ALL revoke row voids global SELECT/ALL as proof — routine
+//     visibility in the revoked schema is gone while the grant row still
+//     looks global. SHOW_ROUTINE itself stays valid: it is global-only and
+//     cannot be partially revoked.
 func hasRoutineGrant(grants []string) bool {
+	selectRestricted := false
 	for _, g := range grants {
-		up := strings.ToUpper(g)
-		privs, target, found := strings.Cut(up, " ON ")
-		if !found {
+		up := strings.ToUpper(strings.TrimSpace(g))
+		if privs, ok := grantPrivileges(up, "REVOKE "); ok &&
+			(privListHas(privs, "SELECT") || privListHas(privs, "ALL PRIVILEGES")) {
+			selectRestricted = true
+		}
+	}
+	for _, g := range grants {
+		up := strings.ToUpper(strings.TrimSpace(g))
+		privs, ok := grantPrivileges(up, "GRANT ")
+		if !ok {
 			continue
 		}
-		global := strings.HasPrefix(strings.TrimSpace(target), "*.*")
+		_, target, _ := strings.Cut(up, " ON ")
+		target = strings.TrimSpace(target)
+		global := strings.HasPrefix(target, "*.* TO ")
+		proc := strings.HasPrefix(target, "`MYSQL`.`PROC` TO ") ||
+			strings.HasPrefix(target, "MYSQL.PROC TO ") ||
+			strings.HasPrefix(target, "`MYSQL`.* TO ") ||
+			strings.HasPrefix(target, "MYSQL.* TO ")
 		switch {
-		case strings.Contains(privs, "SHOW_ROUTINE") && global:
+		case global && privListHas(privs, "SHOW_ROUTINE"):
 			return true
-		case strings.Contains(privs, "ALL PRIVILEGES") && global:
+		case global && !selectRestricted &&
+			(privListHas(privs, "ALL PRIVILEGES") || privListHas(privs, "SELECT")):
 			return true
-		case containsPrivilege(privs, "SELECT") && global:
-			return true
-		case containsPrivilege(privs, "SELECT") &&
-			(strings.HasPrefix(strings.TrimSpace(target), "`MYSQL`.`PROC`") ||
-				strings.HasPrefix(strings.TrimSpace(target), "MYSQL.PROC") ||
-				strings.HasPrefix(strings.TrimSpace(target), "`MYSQL`.*") ||
-				strings.HasPrefix(strings.TrimSpace(target), "MYSQL.*")):
+		case proc && !selectRestricted && privListHas(privs, "SELECT"):
 			return true
 		}
 	}
 	return false
 }
 
-// containsPrivilege reports whether the comma-separated privilege list of a
-// GRANT statement names the privilege exactly (substring matching would let
-// "SHOW VIEW" shadow "SHOW_ROUTINE" or similar prefixes).
-func containsPrivilege(privs, want string) bool {
-	privs = strings.TrimPrefix(strings.TrimSpace(privs), "GRANT ")
+// grantPrivileges extracts the privilege list of one SHOW GRANTS row: the
+// text between the statement keyword and its " ON " clause. A row with no
+// ON clause (role assignments, PROXY) or with a quote character inside the
+// would-be privilege list (the cut landed inside a quoted identifier) is
+// not a privilege row — never trust it.
+func grantPrivileges(row, keyword string) (string, bool) {
+	if !strings.HasPrefix(row, keyword) {
+		return "", false
+	}
+	privs, _, found := strings.Cut(strings.TrimPrefix(row, keyword), " ON ")
+	if !found || strings.ContainsAny(privs, "`'\"") {
+		return "", false
+	}
+	return privs, true
+}
+
+// privListHas reports whether the comma-separated privilege list names the
+// privilege exactly (substring matching would let "SHOW VIEW" shadow
+// "SHOW_ROUTINE" or similar prefixes).
+func privListHas(privs, want string) bool {
 	for _, p := range strings.Split(privs, ",") {
 		if strings.TrimSpace(p) == want {
 			return true

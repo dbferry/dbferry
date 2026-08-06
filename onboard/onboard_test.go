@@ -108,6 +108,14 @@ func TestMySQLGrantsEscapeWildcards(t *testing.T) {
 	if !strings.Contains(sql, "ON `my_db`.*") || !strings.Contains(sql, "partial_revokes") {
 		t.Errorf("missing literal partial_revokes=ON alternative:\n%s", sql)
 	}
+	// Neither spelling may be executable: a blind run must fail loudly (no
+	// grant) rather than silently grant the wrong database when the guessed
+	// mode is wrong (Codex R1 P2).
+	for _, line := range strings.Split(sql, "\n") {
+		if strings.HasPrefix(line, "GRANT ") && strings.Contains(line, "my") {
+			t.Errorf("wildcard-name grant emitted as executable SQL: %q", line)
+		}
+	}
 
 	// A clean name gets the plain single-grant script — no confusing caveat.
 	clean, err := MySQLGrants("backup", "shop")

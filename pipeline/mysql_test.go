@@ -192,6 +192,41 @@ func TestHasRoutineGrant(t *testing.T) {
 		{"select on other db", []string{"GRANT SELECT ON `mysqlish`.* TO 'u'@'%'"}, false},
 		{"no ON clause", []string{"GRANT PROXY"}, false},
 		{"empty", nil, false},
+		// Adversarial role names (Codex R1 P1): a role literally named
+		// "SHOW_ROUTINE ON *.*" is an assignment row, not a privilege row —
+		// the quote inside the would-be privilege list disqualifies it.
+		{"hostile role name show_routine", []string{
+			"GRANT USAGE ON *.* TO 'u'@'%'",
+			"GRANT `SHOW_ROUTINE ON *.*`@`%` TO `u`@`%`",
+		}, false},
+		{"hostile role name all privileges", []string{
+			"GRANT `ALL PRIVILEGES ON *.*`@`%` TO `u`@`%`",
+		}, false},
+		// Partial revokes (Codex R1 P1): a REVOKE row voids global
+		// SELECT/ALL as proof — the revoked schema's routines are invisible
+		// while the grant row still looks global.
+		{"partial revoke voids global select", []string{
+			"GRANT SELECT ON *.* TO 'u'@'%'",
+			"REVOKE SELECT ON `shop`.* FROM 'u'@'%'",
+		}, false},
+		{"partial revoke voids all privileges", []string{
+			"GRANT ALL PRIVILEGES ON *.* TO 'u'@'%'",
+			"REVOKE ALL PRIVILEGES ON `shop`.* FROM 'u'@'%'",
+		}, false},
+		// ...but SHOW_ROUTINE is global-only and survives partial revokes.
+		{"show_routine survives partial revoke", []string{
+			"GRANT SHOW_ROUTINE ON *.* TO 'u'@'%'",
+			"REVOKE SELECT ON `shop`.* FROM 'u'@'%'",
+		}, true},
+		// A revoke row with a quoted pseudo-privilege list must not flip
+		// the restriction flag either.
+		{"hostile role revoke ignored", []string{
+			"GRANT SELECT ON *.* TO 'u'@'%'",
+			"REVOKE `SELECT ON x`@`%` FROM `u`@`%`",
+		}, true},
+		{"grant option suffix still global", []string{
+			"GRANT SELECT ON *.* TO 'u'@'%' WITH GRANT OPTION",
+		}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -199,5 +234,40 @@ func TestHasRoutineGrant(t *testing.T) {
 				t.Errorf("hasRoutineGrant(%q) = %v, want %v", tt.grants, got, tt.want)
 			}
 		})
+	}
+}
+
+// tls= is the go-sql-driver spelling managed providers hand out (DO:
+// ?tls=true). It must map onto ssl-mode, not be silently dropped — a DSN
+// that asks for TLS must get TLS or an error (Codex R1 P1).
+func TestParseMySQLDSNTLSAlias(t *testing.T) {
+	tests := []struct {
+		dsn     string
+		want    string // resulting sslMode
+		wantErr bool
+	}{
+		{"mysql://u@h:3306/db?tls=true", "REQUIRED", false},
+		{"mysql://u@h:3306/db?tls=false", "DISABLED", false},
+		{"mysql://u@h:3306/db?tls=preferred", "PREFERRED", false},
+		{"mysql://u@h:3306/db?tls=skip-verify", "REQUIRED", false},
+		{"mysql://u@h:3306/db?tls=banana", "", true},
+		{"mysql://u@h:3306/db?ssl-mode=DISABLED&tls=true", "", true},
+		{"mysql://u@h:3306/db?ssl-mode=REQUIRED&tls=true", "REQUIRED", false},
+	}
+	for _, tt := range tests {
+		src, err := parseMySQLDSN(tt.dsn)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseMySQLDSN(%q): expected error", tt.dsn)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseMySQLDSN(%q): %v", tt.dsn, err)
+			continue
+		}
+		if src.sslMode != tt.want {
+			t.Errorf("parseMySQLDSN(%q).sslMode = %q, want %q", tt.dsn, src.sslMode, tt.want)
+		}
 	}
 }
