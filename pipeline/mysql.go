@@ -68,7 +68,12 @@ func parseMySQLDSN(dsn string) (mysqlSource, error) {
 	// would fail open — a DSN that asks for TLS must get TLS or an error.
 	if tlsParam := strings.ToLower(u.Query().Get("tls")); tlsParam != "" {
 		mapped, ok := map[string]string{
-			"true": "REQUIRED", "false": "DISABLED",
+			// tls=true VERIFIES the server certificate and hostname in
+			// go-sql-driver — its ssl-mode equivalent is VERIFY_IDENTITY.
+			// Mapping it to REQUIRED would silently drop verification;
+			// against a provider-private CA the verified mode fails loudly
+			// instead, and the error names the honest alternatives.
+			"true": "VERIFY_IDENTITY", "false": "DISABLED",
 			"skip-verify": "REQUIRED", "preferred": "PREFERRED",
 		}[tlsParam]
 		if !ok {

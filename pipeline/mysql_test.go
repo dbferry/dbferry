@@ -246,13 +246,19 @@ func TestParseMySQLDSNTLSAlias(t *testing.T) {
 		want    string // resulting sslMode
 		wantErr bool
 	}{
-		{"mysql://u@h:3306/db?tls=true", "REQUIRED", false},
+		// tls=true means VERIFIED TLS in go-sql-driver — the alias must
+		// keep that strength, never downgrade to unverified REQUIRED
+		// (Codex R2).
+		{"mysql://u@h:3306/db?tls=true", "VERIFY_IDENTITY", false},
 		{"mysql://u@h:3306/db?tls=false", "DISABLED", false},
 		{"mysql://u@h:3306/db?tls=preferred", "PREFERRED", false},
 		{"mysql://u@h:3306/db?tls=skip-verify", "REQUIRED", false},
 		{"mysql://u@h:3306/db?tls=banana", "", true},
 		{"mysql://u@h:3306/db?ssl-mode=DISABLED&tls=true", "", true},
-		{"mysql://u@h:3306/db?ssl-mode=REQUIRED&tls=true", "REQUIRED", false},
+		// Different strengths spelled together must be an error, not a
+		// silent pick.
+		{"mysql://u@h:3306/db?ssl-mode=REQUIRED&tls=true", "", true},
+		{"mysql://u@h:3306/db?ssl-mode=VERIFY_IDENTITY&tls=true", "VERIFY_IDENTITY", false},
 	}
 	for _, tt := range tests {
 		src, err := parseMySQLDSN(tt.dsn)
@@ -269,5 +275,20 @@ func TestParseMySQLDSNTLSAlias(t *testing.T) {
 		if src.sslMode != tt.want {
 			t.Errorf("parseMySQLDSN(%q).sslMode = %q, want %q", tt.dsn, src.sslMode, tt.want)
 		}
+	}
+
+	// The alias must reach BOTH consumers with verification intact: the Go
+	// driver DSN gets tls=true (verify), and the dump tools get
+	// --ssl-mode=VERIFY_IDENTITY — not the unverified skip-verify/REQUIRED
+	// pair.
+	src, err := parseMySQLDSN("mysql://u@h:3306/db?tls=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dsn := src.goDSN(); !strings.Contains(dsn, "tls=true") {
+		t.Errorf("goDSN for tls=true lacks verified tls config: %q", dsn)
+	}
+	if args := src.sslArgs(); len(args) != 1 || args[0] != "--ssl-mode=VERIFY_IDENTITY" {
+		t.Errorf("sslArgs for tls=true = %v, want [--ssl-mode=VERIFY_IDENTITY]", args)
 	}
 }
