@@ -206,3 +206,48 @@ func TestS3Policy(t *testing.T) {
 		t.Error("policy accepted a wildcard bucket name")
 	}
 }
+
+// Multi-database scripts: one role/user, every listed database covered, the
+// global sections emitted once (fnd-infra S2 — multi-tenant clusters).
+func TestGrantsMultiDatabase(t *testing.T) {
+	pg, err := PostgresGrants("backup", "tenant_a", "tenant_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`GRANT CONNECT ON DATABASE "tenant_a" TO "backup"`,
+		`GRANT CONNECT ON DATABASE "tenant_b" TO "backup"`,
+	} {
+		if !strings.Contains(pg, want) {
+			t.Errorf("postgres multi grants miss %q", want)
+		}
+	}
+	if strings.Count(pg, "CREATE ROLE") != 1 || strings.Count(pg, "GRANT pg_read_all_data") != 1 {
+		t.Errorf("postgres multi grants must create the role and grant read once:\n%s", pg)
+	}
+
+	my, err := MySQLGrants("backup", "shop", "tenant_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ON `shop`.* TO 'backup'@'%'",
+		"ON `tenant\\_b`.* TO 'backup'@'%'",
+		"ON `tenant_b`.* TO 'backup'@'%'", // literal partial_revokes=ON alternative
+	} {
+		if !strings.Contains(my, want) {
+			t.Errorf("mysql multi grants miss %q", want)
+		}
+	}
+	if strings.Count(my, "CREATE USER") != 1 || strings.Count(my, "GRANT SHOW_ROUTINE") != 1 {
+		t.Errorf("mysql multi grants must create the user and grant SHOW_ROUTINE once:\n%s", my)
+	}
+
+	// One bad name anywhere rejects the whole script.
+	if _, err := PostgresGrants("backup", "ok", "bad\nname"); err == nil {
+		t.Error("postgres multi grants accepted a hostile database name")
+	}
+	if _, err := MySQLGrants("backup"); err == nil {
+		t.Error("mysql grants accepted an empty database list")
+	}
+}
