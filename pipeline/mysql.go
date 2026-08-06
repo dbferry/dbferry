@@ -266,5 +266,87 @@ func (d *mysqlDriver) Diagnose(ctx context.Context) []Check {
 		return []Check{{Name: "mysqldump client", Status: StatusFail, Detail: "not found on PATH",
 			Fix: "install the MySQL client tools (mysql-client / mysql-community-client)"}}
 	}
-	return []Check{{Name: "mysqldump client", Status: StatusOK, Detail: d.DumpClientVersion(ctx)}}
+	checks := []Check{{Name: "mysqldump client", Status: StatusOK, Detail: d.DumpClientVersion(ctx)}}
+	checks = append(checks, d.diagnoseRoutineAccess(ctx))
+	return checks
+}
+
+// diagnoseRoutineAccess reports whether the dump will include stored
+// programs. mysqldump --routines does NOT fail without SHOW_ROUTINE — the
+// server just filters information_schema.routines by privilege and the
+// routines silently vanish from the dump, so the doctor has to say it out
+// loud; a missed grant otherwise surfaces only during a restore.
+func (d *mysqlDriver) diagnoseRoutineAccess(ctx context.Context) Check {
+	const name = "stored routines"
+	db, err := sql.Open("mysql", d.src.goDSN())
+	if err != nil {
+		return Check{Name: name, Status: StatusWarn, Detail: "could not check grants: " + err.Error()}
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, "SHOW GRANTS FOR CURRENT_USER()")
+	if err != nil {
+		return Check{Name: name, Status: StatusWarn, Detail: "could not check grants: " + err.Error()}
+	}
+	defer rows.Close()
+	var grants []string
+	for rows.Next() {
+		var g string
+		if err := rows.Scan(&g); err != nil {
+			return Check{Name: name, Status: StatusWarn, Detail: "could not check grants: " + err.Error()}
+		}
+		grants = append(grants, g)
+	}
+	if err := rows.Err(); err != nil {
+		return Check{Name: name, Status: StatusWarn, Detail: "could not check grants: " + err.Error()}
+	}
+	if hasRoutineGrant(grants) {
+		return Check{Name: name, Status: StatusOK, Detail: "SHOW_ROUTINE (or equivalent) granted — stored programs will be included"}
+	}
+	return Check{Name: name, Status: StatusWarn,
+		Detail: "SHOW_ROUTINE is not granted — stored procedures/functions will be silently missing from dumps (fine if you have none)",
+		Fix:    "GRANT SHOW_ROUTINE ON *.* TO the backup user (MySQL 8.0.20+; older servers: GRANT SELECT ON mysql.proc)"}
+}
+
+// hasRoutineGrant reports whether any SHOW GRANTS line lets the user read
+// stored program definitions: SHOW_ROUTINE (8.0.20+), a global ALL or SELECT,
+// or the pre-8.0.20 SELECT on mysql.proc. Matching is deliberately
+// conservative — an unrecognized-but-sufficient grant yields a warn, never
+// the reverse.
+func hasRoutineGrant(grants []string) bool {
+	for _, g := range grants {
+		up := strings.ToUpper(g)
+		privs, target, found := strings.Cut(up, " ON ")
+		if !found {
+			continue
+		}
+		global := strings.HasPrefix(strings.TrimSpace(target), "*.*")
+		switch {
+		case strings.Contains(privs, "SHOW_ROUTINE") && global:
+			return true
+		case strings.Contains(privs, "ALL PRIVILEGES") && global:
+			return true
+		case containsPrivilege(privs, "SELECT") && global:
+			return true
+		case containsPrivilege(privs, "SELECT") &&
+			(strings.HasPrefix(strings.TrimSpace(target), "`MYSQL`.`PROC`") ||
+				strings.HasPrefix(strings.TrimSpace(target), "MYSQL.PROC") ||
+				strings.HasPrefix(strings.TrimSpace(target), "`MYSQL`.*") ||
+				strings.HasPrefix(strings.TrimSpace(target), "MYSQL.*")):
+			return true
+		}
+	}
+	return false
+}
+
+// containsPrivilege reports whether the comma-separated privilege list of a
+// GRANT statement names the privilege exactly (substring matching would let
+// "SHOW VIEW" shadow "SHOW_ROUTINE" or similar prefixes).
+func containsPrivilege(privs, want string) bool {
+	privs = strings.TrimPrefix(strings.TrimSpace(privs), "GRANT ")
+	for _, p := range strings.Split(privs, ",") {
+		if strings.TrimSpace(p) == want {
+			return true
+		}
+	}
+	return false
 }

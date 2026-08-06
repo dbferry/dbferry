@@ -165,3 +165,39 @@ func TestMySQLSSLModeReachesDriverAndTools(t *testing.T) {
 		t.Errorf("dump argv without ssl-mode must not carry the flag: %q", plain)
 	}
 }
+
+func TestHasRoutineGrant(t *testing.T) {
+	tests := []struct {
+		name   string
+		grants []string
+		want   bool
+	}{
+		{"show_routine global", []string{"GRANT SHOW_ROUTINE ON *.* TO 'u'@'%'"}, true},
+		{"our snippet", []string{
+			"GRANT USAGE ON *.* TO 'dbferry_backup'@'%'",
+			"GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON `shop`.* TO 'dbferry_backup'@'%'",
+			"GRANT SHOW_ROUTINE ON *.* TO 'dbferry_backup'@'%'",
+		}, true},
+		{"db-scoped select only", []string{
+			"GRANT USAGE ON *.* TO 'u'@'%'",
+			"GRANT SELECT, SHOW VIEW, EVENT, TRIGGER ON `shop`.* TO 'u'@'%'",
+		}, false},
+		{"global select", []string{"GRANT SELECT ON *.* TO 'u'@'%'"}, true},
+		{"all privileges", []string{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'"}, true},
+		{"legacy mysql.proc", []string{"GRANT SELECT ON `mysql`.`proc` TO 'u'@'%'"}, true},
+		{"usage only", []string{"GRANT USAGE ON *.* TO 'u'@'%'"}, false},
+		// SHOW VIEW must not read as a SELECT/SHOW_ROUTINE lookalike, and a
+		// db-scoped SHOW_ROUTINE-looking grant must not count as global.
+		{"show view global is not enough", []string{"GRANT SHOW VIEW ON *.* TO 'u'@'%'"}, false},
+		{"select on other db", []string{"GRANT SELECT ON `mysqlish`.* TO 'u'@'%'"}, false},
+		{"no ON clause", []string{"GRANT PROXY"}, false},
+		{"empty", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasRoutineGrant(tt.grants); got != tt.want {
+				t.Errorf("hasRoutineGrant(%q) = %v, want %v", tt.grants, got, tt.want)
+			}
+		})
+	}
+}
